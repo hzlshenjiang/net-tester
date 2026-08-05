@@ -126,7 +126,7 @@ class TimedDownloader(threading.Thread):
             req = urllib.request.Request(self.url, headers={"User-Agent": "Mozilla/5.0"})
             with urllib.request.urlopen(req, timeout=self.duration + 5, context=_ctx) as resp:
                 while not self._should_stop and (time.time() - start) < self.duration:
-                    chunk = resp.read(65536)
+                    chunk = resp.read(131072)  # 128KB
                     if not chunk:
                         break
                     total_bytes += len(chunk)
@@ -136,20 +136,35 @@ class TimedDownloader(threading.Thread):
         self.result_queue.put((self.thread_id, total_bytes, elapsed))
 
 
-def measure_download_timed(url, duration=DOWNLOAD_DURATION, threads=4, callback=None):
-    """多线程持续下载，返回速度 Mbps"""
+def measure_download_timed(urls, duration=DOWNLOAD_DURATION, threads_per_url=8, callback=None):
+    """多 URL 多线程持续下载，返回 (总字节, 速度Mbps)
+    
+    urls 可以是单个 URL 字符串或 URL 列表。
+    每个 URL 开 threads_per_url 个线程，总线程数 = len(urls) * threads_per_url。
+    自适应：单 URL 时开 12 线程，多 URL 时每 URL 开 8 线程。
+    """
+    if isinstance(urls, str):
+        urls = [urls]
+    
+    # 自适应线程数：确保总线程 16-24 之间
+    if len(urls) == 1:
+        threads_per_url = 12
+    total_threads = len(urls) * threads_per_url
+    
     q = Queue()
     workers = []
-    for i in range(threads):
-        t = TimedDownloader(url, duration, q, i)
-        workers.append(t)
-        t.start()
+    for url in urls:
+        for i in range(threads_per_url):
+            t = TimedDownloader(url, duration, q, len(workers))
+            workers.append(t)
+            t.start()
 
-    # 等待所有线程完成
+    if callback:
+        callback(f"下载中: {len(urls)}个源 × {threads_per_url}线程 = {total_threads}连接")
+
     for t in workers:
         t.join(timeout=duration + 10)
 
-    # 统计总字节
     total_bytes = 0
     max_elapsed = 0
     while not q.empty():
@@ -199,7 +214,7 @@ class TimedUploader(threading.Thread):
         self.result_queue.put((self.thread_id, total_bytes, elapsed))
 
 
-def measure_upload_timed(url, duration=UPLOAD_DURATION, threads=2, callback=None):
+def measure_upload_timed(url, duration=UPLOAD_DURATION, threads=8, callback=None):
     """多线程持续上传，返回速度 Mbps"""
     q = Queue()
     workers = []
@@ -374,12 +389,14 @@ class SpeedTestApp:
             self._update_progress(20)
             self._stop_dots()
 
-            # 3. 下载测速——多线程持续 10 秒
+            # 3. 下载测速——多 URL 多线程持续 10 秒
             self._update_status(f"正在测试下载速度（{DOWNLOAD_DURATION}秒）")
             self._update("download", "下载速度：测试中")
             self._start_dots("下载测速中")
 
-            total_bytes, dl_speed = measure_download_timed(best_url, duration=DOWNLOAD_DURATION, threads=4, callback=self._update_realtime)
+            # 用所有可达源（不只最优源），多 URL 并行突破 CDN 单 IP 限速
+            all_urls = [url for _, url in DOWNLOAD_SOURCES]
+            total_bytes, dl_speed = measure_download_timed(all_urls, duration=DOWNLOAD_DURATION, threads_per_url=8, callback=self._update_realtime)
 
             self._stop_dots()
             results["download"] = dl_speed
@@ -392,7 +409,12 @@ class SpeedTestApp:
             self._update("upload", "上传速度：测试中")
             self._start_dots("上传测速中")
 
-            total_up, ul_speed = measure_upload_timed(UPLOAD_URL, duration=UPLOAD_DURATION, threads=2, callback=self._update_realtime)
+            total_up, ul_speed = measure_upload_timed(UPLOAD_URL, duration=UPLOAD_DURATION, threads=8, callback=self._update_realtime)
+
+            # 如果 8 线程上传偏低，自动加到 12 线程重试一次
+            if ul_speed < 10:
+                self._update_realtime(f"上传 {ul_speed:.0f} Mbps 偏低，12 线程重试...")
+                total_up, ul_speed = measure_upload_timed(UPLOAD_URL, duration=UPLOAD_DURATION, threads=12, callback=self._update_realtime)
 
             self._stop_dots()
             results["upload"] = ul_speed
