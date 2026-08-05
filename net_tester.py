@@ -114,10 +114,10 @@ class TimedDownloader(threading.Thread):
         self.duration = duration
         self.result_queue = result_queue
         self.thread_id = thread_id
-        self._stop = False
+        self._should_stop = False
 
     def stop(self):
-        self._stop = True
+        self._should_stop = True
 
     def run(self):
         total_bytes = 0
@@ -125,7 +125,7 @@ class TimedDownloader(threading.Thread):
         try:
             req = urllib.request.Request(self.url, headers={"User-Agent": "Mozilla/5.0"})
             with urllib.request.urlopen(req, timeout=self.duration + 5, context=_ctx) as resp:
-                while not self._stop and (time.time() - start) < self.duration:
+                while not self._should_stop and (time.time() - start) < self.duration:
                     chunk = resp.read(65536)
                     if not chunk:
                         break
@@ -174,17 +174,17 @@ class TimedUploader(threading.Thread):
         self.result_queue = result_queue
         self.thread_id = thread_id
         self.chunk = b"0" * chunk_size
-        self._stop = False
+        self._should_stop = False
 
     def stop(self):
-        self._stop = True
+        self._should_stop = True
 
     def run(self):
         total_bytes = 0
         start = time.time()
         try:
             # 每次上传 512KB，持续 duration 秒
-            while not self._stop and (time.time() - start) < self.duration:
+            while not self._should_stop and (time.time() - start) < self.duration:
                 req = urllib.request.Request(
                     self.url, data=self.chunk,
                     headers={"User-Agent": "Mozilla/5.0", "Content-Type": "application/octet-stream"},
