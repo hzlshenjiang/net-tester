@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """网络测速工具 - 绿色版
 
-测速方案（针对国内优化）：
-- 下载：国内 CDN 源（华为云/腾讯），20-30MB 文件，多源取最快
-- 上传：Cloudflare speed test 端点，5MB 数据
-- 延迟：TCP 连接测延迟
-- 防呆：每步超时保护，自动跳过失败源
-- 分辨率自适应：DPI 缩放
+测速方案（参考 speedtest-cli 核心逻辑，针对国内优化）：
+1. 探测选源：小文件下载测延迟，选最快的 CDN
+2. 下载测速：多线程持续下载 10 秒，取总吞吐量
+3. 上传测速：POST 大数据 10 秒，取吞吐量
+4. 延迟：TCP 连接测延迟
+
+支持高带宽（千兆）：按时间截断而非固定大小，TCP 充分爬坡。
 """
 
 import tkinter as tk
@@ -18,6 +19,7 @@ import sys
 import ssl
 import socket
 import urllib.request
+from queue import Queue
 
 
 # ─── 测速核心 ───
@@ -26,22 +28,25 @@ _ctx = ssl.create_default_context()
 _ctx.check_hostname = False
 _ctx.verify_mode = ssl.CERT_NONE
 
-# 强制 IPv4（避免 IPv6 DNS 解析问题）
-_orig_getaddrinfo = socket.getaddrinfo
-def _ipv4_only(*args, **kwargs):
-    return [r for r in _orig_getaddrinfo(*args, **kwargs) if r[0] == socket.AF_INET]
-socket.getaddrinfo = _ipv4_only
+# 强制 IPv4
+_orig = socket.getaddrinfo
+socket.getaddrinfo = lambda *a, **k: [r for r in _orig(*a, **k) if r[0] == socket.AF_INET]
 
-# 下载测速源（国内 CDN，文件大小 20-30MB 最准确）
+# 下载测速源
 DOWNLOAD_SOURCES = [
     ("华为云镜像", "https://mirrors.huaweicloud.com/nodejs/v20.17.0/node-v20.17.0-x64.msi"),
     ("华为云-Python", "https://mirrors.huaweicloud.com/python/3.12.5/Python-3.12.5.tgz"),
     ("腾讯-微信", "https://dldir1.qq.com/weixin/Windows/WeChatSetup.exe"),
 ]
 
-# 上传测速端点
+# 上传端点
 UPLOAD_URL = "https://speed.cloudflare.com/__up"
-UPLOAD_DATA_SIZE = 5 * 1024 * 1024  # 5MB——够准确且不太慢
+
+# 测速持续时间（秒）
+DOWNLOAD_DURATION = 10
+UPLOAD_DURATION = 10
+# 探测超时（秒）
+PROBE_TIMEOUT = 3
 
 
 def measure_ping(host, port=443, count=5, timeout=5):
@@ -61,40 +66,163 @@ def measure_ping(host, port=443, count=5, timeout=5):
     return sum(latencies) / len(latencies)
 
 
-def try_download(url, timeout=20):
-    """尝试下载，返回 (字节数, 耗时秒, 速度Mbps) 或 None"""
+def probe_source(name, url, timeout=PROBE_TIMEOUT):
+    """探测一个源：下载前 1MB，测延迟和初步速度"""
     try:
         start = time.time()
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0", "Range": "bytes=0-1048575"})
         with urllib.request.urlopen(req, timeout=timeout, context=_ctx) as resp:
-            data = resp.read()
+            data = resp.read(1048576)
         elapsed = time.time() - start
-        if elapsed < 0.3:
-            return None  # 太快不可靠
-        speed_mbps = len(data) / elapsed * 8 / 1_000_000
-        return len(data), elapsed, speed_mbps
+        if elapsed < 0.05:
+            return name, 0, elapsed * 1000  # 太快，延迟极低
+        return name, len(data), elapsed * 1000
     except Exception:
-        return None
+        return name, 0, 99999
 
 
-def measure_upload(url, data, timeout=30):
-    """上传测速，返回 (字节数, 耗时秒, 速度Mbps) 或 None"""
-    try:
+def select_best_source(sources, callback=None):
+    """探测所有源，选延迟最低的"""
+    results = []
+    for name, url in sources:
+        if callback:
+            callback(f"探测 {name}...")
+        _, size, latency_ms = probe_source(name, url)
+        if size > 0:
+            results.append((name, url, latency_ms))
+            if callback:
+                callback(f"{name}: 延迟 {latency_ms:.0f}ms")
+        else:
+            if callback:
+                callback(f"{name}: 不可达")
+
+    if not results:
+        return None, None, 0
+
+    # 按延迟排序，选最快的
+    results.sort(key=lambda x: x[2])
+    best = results[0]
+    return best[0], best[1], best[2]
+
+
+class TimedDownloader(threading.Thread):
+    """按时间下载——持续下载指定秒数，统计总字节数"""
+
+    def __init__(self, url, duration, result_queue, thread_id):
+        super().__init__(daemon=True)
+        self.url = url
+        self.duration = duration
+        self.result_queue = result_queue
+        self.thread_id = thread_id
+        self._stop = False
+
+    def stop(self):
+        self._stop = True
+
+    def run(self):
+        total_bytes = 0
         start = time.time()
-        req = urllib.request.Request(
-            url, data=data,
-            headers={"User-Agent": "Mozilla/5.0", "Content-Type": "application/octet-stream"},
-            method="POST",
-        )
-        with urllib.request.urlopen(req, timeout=timeout, context=_ctx) as resp:
-            resp.read()
+        try:
+            req = urllib.request.Request(self.url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=self.duration + 5, context=_ctx) as resp:
+                while not self._stop and (time.time() - start) < self.duration:
+                    chunk = resp.read(65536)
+                    if not chunk:
+                        break
+                    total_bytes += len(chunk)
+        except Exception:
+            pass
         elapsed = time.time() - start
-        if elapsed < 0.3:
-            return None
-        speed_mbps = len(data) / elapsed * 8 / 1_000_000
-        return len(data), elapsed, speed_mbps
-    except Exception:
-        return None
+        self.result_queue.put((self.thread_id, total_bytes, elapsed))
+
+
+def measure_download_timed(url, duration=DOWNLOAD_DURATION, threads=4, callback=None):
+    """多线程持续下载，返回速度 Mbps"""
+    q = Queue()
+    workers = []
+    for i in range(threads):
+        t = TimedDownloader(url, duration, q, i)
+        workers.append(t)
+        t.start()
+
+    # 等待所有线程完成
+    for t in workers:
+        t.join(timeout=duration + 10)
+
+    # 统计总字节
+    total_bytes = 0
+    max_elapsed = 0
+    while not q.empty():
+        _, bytes_down, elapsed = q.get()
+        total_bytes += bytes_down
+        max_elapsed = max(max_elapsed, elapsed)
+
+    if max_elapsed < 0.5:
+        return 0, 0
+
+    speed_mbps = total_bytes / max_elapsed * 8 / 1_000_000
+    return total_bytes, speed_mbps
+
+
+class TimedUploader(threading.Thread):
+    """按时间上传——持续 POST 数据，统计总字节数"""
+
+    def __init__(self, url, duration, result_queue, thread_id, chunk_size=512*1024):
+        super().__init__(daemon=True)
+        self.url = url
+        self.duration = duration
+        self.result_queue = result_queue
+        self.thread_id = thread_id
+        self.chunk = b"0" * chunk_size
+        self._stop = False
+
+    def stop(self):
+        self._stop = True
+
+    def run(self):
+        total_bytes = 0
+        start = time.time()
+        try:
+            # 每次上传 512KB，持续 duration 秒
+            while not self._stop and (time.time() - start) < self.duration:
+                req = urllib.request.Request(
+                    self.url, data=self.chunk,
+                    headers={"User-Agent": "Mozilla/5.0", "Content-Type": "application/octet-stream"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(req, timeout=15, context=_ctx) as resp:
+                    resp.read()
+                total_bytes += len(self.chunk)
+        except Exception:
+            pass
+        elapsed = time.time() - start
+        self.result_queue.put((self.thread_id, total_bytes, elapsed))
+
+
+def measure_upload_timed(url, duration=UPLOAD_DURATION, threads=2, callback=None):
+    """多线程持续上传，返回速度 Mbps"""
+    q = Queue()
+    workers = []
+    for i in range(threads):
+        t = TimedUploader(url, duration, q, i)
+        workers.append(t)
+        t.start()
+
+    for t in workers:
+        t.join(timeout=duration + 10)
+
+    total_bytes = 0
+    max_elapsed = 0
+    while not q.empty():
+        _, bytes_up, elapsed = q.get()
+        total_bytes += bytes_up
+        max_elapsed = max(max_elapsed, elapsed)
+
+    if max_elapsed < 0.5:
+        return 0, 0
+
+    speed_mbps = total_bytes / max_elapsed * 8 / 1_000_000
+    return total_bytes, speed_mbps
 
 
 # ─── 动态省略号动画 ───
@@ -132,7 +260,7 @@ class SpeedTestApp:
 
         self._setup_dpi()
         self.W = self.scale(560)
-        self.H = self.scale(620)
+        self.H = self.scale(640)
         self.root.geometry(f"{self.W}x{self.H}")
         self.root.resizable(False, False)
 
@@ -165,7 +293,7 @@ class SpeedTestApp:
 
     def _build_ui(self):
         ttk.Label(self.root, text="网络测速工具", font=self._font(18, "bold")).pack(pady=(self.scale(20), self.scale(5)))
-        ttk.Label(self.root, text="多源 CDN 测速 · 自动选最优节点", font=self._font(10), foreground="gray").pack(pady=(0, self.scale(10)))
+        ttk.Label(self.root, text="智能选源 · 定时测速 · 多线程", font=self._font(10), foreground="gray").pack(pady=(0, self.scale(10)))
 
         self.status_var = tk.StringVar(value="就绪 — 点击开始测速")
         ttk.Label(self.root, textvariable=self.status_var, font=self._font(11)).pack(pady=self.scale(3))
@@ -194,7 +322,6 @@ class SpeedTestApp:
         self.btn_start = ttk.Button(self.root, text="开始测速", command=self.start_test)
         self.btn_start.pack(pady=self.scale(8))
 
-        # 报告区域——完整显示
         self.report_text = tk.Text(
             self.root, height=11, width=62,
             font=("Consolas", self.scale(9)),
@@ -220,72 +347,60 @@ class SpeedTestApp:
     def _run_test(self):
         results = {}
         try:
-            # 1. 延迟——超时 5 秒
-            self._update_status("正在测试网络延迟")
-            self._start_dots("测试延迟中")
+            # 1. 探测选源
+            self._update_status("正在探测最优节点")
+            self._start_dots("探测中")
             self._update_progress(5)
-            ping = measure_ping("mirrors.huaweicloud.com", 443, 5, timeout=5)
-            results["ping"] = ping
-            self._update("ping", f"延迟：{ping:.0f} ms" if ping > 0 else "延迟：超时")
-            self._update_progress(10)
+
+            best_name, best_url, probe_latency = select_best_source(DOWNLOAD_SOURCES, callback=self._update_realtime)
+
+            if best_name is None:
+                self._update_status("所有节点不可达，请检查网络")
+                self._stop_dots()
+                return
+
+            self._update("server", f"最佳节点：{best_name}（延迟 {probe_latency:.0f}ms）")
+            results["source"] = best_name
+            self._update_progress(15)
             self._stop_dots()
 
-            # 2. 下载——每个源超时 20 秒
-            self._update_status("正在测试下载速度")
+            # 2. 延迟
+            self._update_status("正在测试网络延迟")
+            self._start_dots("测试延迟中")
+            # 用探测到的延迟即可
+            ping = measure_ping("mirrors.huaweicloud.com" if "huaweicloud" in best_url else "dldir1.qq.com", 443, 5, timeout=5)
+            results["ping"] = ping if ping > 0 else probe_latency
+            self._update("ping", f"延迟：{results['ping']:.0f} ms")
+            self._update_progress(20)
+            self._stop_dots()
+
+            # 3. 下载测速——多线程持续 10 秒
+            self._update_status(f"正在测试下载速度（{DOWNLOAD_DURATION}秒）")
             self._update("download", "下载速度：测试中")
             self._start_dots("下载测速中")
 
-            best_dl = 0
-            best_name = "—"
-            for name, url in DOWNLOAD_SOURCES:
-                self._update_realtime(f"正在从 {name} 下载")
-                result = try_download(url, timeout=20)
-                if result:
-                    size, elapsed, speed = result
-                    self._update_realtime(f"{name}: {size/1_000_000:.1f}MB / {elapsed:.1f}s = {speed:.2f} Mbps")
-                    if speed > best_dl:
-                        best_dl = speed
-                        best_name = name
-                else:
-                    self._update_realtime(f"{name}: 跳过")
-                time.sleep(0.3)
+            total_bytes, dl_speed = measure_download_timed(best_url, duration=DOWNLOAD_DURATION, threads=4, callback=self._update_realtime)
 
             self._stop_dots()
-            results["download"] = best_dl
-            results["download_source"] = best_name
-            self._update("download", f"下载速度：{best_dl:.2f} Mbps" if best_dl > 0 else "下载速度：全部失败")
-            self._update("server", f"最佳节点：{best_name}")
-            self._update_progress(55)
+            results["download"] = dl_speed
+            self._update("download", f"下载速度：{dl_speed:.2f} Mbps")
+            self._update_realtime(f"下载完成: {total_bytes/1_000_000:.1f}MB / {DOWNLOAD_DURATION}s = {dl_speed:.2f} Mbps")
+            self._update_progress(60)
 
-            # 3. 上传——5MB 超时 30 秒
-            self._update_status("正在测试上传速度")
+            # 4. 上传测速——持续 10 秒
+            self._update_status(f"正在测试上传速度（{UPLOAD_DURATION}秒）")
             self._update("upload", "上传速度：测试中")
             self._start_dots("上传测速中")
 
-            upload_data = b"0" * UPLOAD_DATA_SIZE
-            self._update_realtime(f"上传 {UPLOAD_DATA_SIZE//1024//1024}MB 到 Cloudflare")
-            result = measure_upload(UPLOAD_URL, upload_data, timeout=30)
-
-            best_ul = 0
-            if result:
-                size, elapsed, speed = result
-                best_ul = speed
-                self._update_realtime(f"上传完成: {size/1_000_000:.1f}MB / {elapsed:.1f}s = {speed:.2f} Mbps")
-            else:
-                # 降级 2MB
-                self._update_realtime("5MB 超时，降级 2MB")
-                result = measure_upload(UPLOAD_URL, b"0" * (2 * 1024 * 1024), timeout=15)
-                if result:
-                    size, elapsed, speed = result
-                    best_ul = speed
-                    self._update_realtime(f"上传完成: {size/1_000_000:.1f}MB / {elapsed:.1f}s = {speed:.2f} Mbps")
+            total_up, ul_speed = measure_upload_timed(UPLOAD_URL, duration=UPLOAD_DURATION, threads=2, callback=self._update_realtime)
 
             self._stop_dots()
-            results["upload"] = best_ul
-            self._update("upload", f"上传速度：{best_ul:.2f} Mbps" if best_ul > 0 else "上传速度：失败")
+            results["upload"] = ul_speed
+            self._update("upload", f"上传速度：{ul_speed:.2f} Mbps")
+            self._update_realtime(f"上传完成: {total_up/1_000_000:.1f}MB / {UPLOAD_DURATION}s = {ul_speed:.2f} Mbps")
             self._update_progress(95)
 
-            # 4. 完成
+            # 5. 完成
             self._update_progress(100)
             self._update_status("测速完成！")
             report = self._generate_report(results)
@@ -303,18 +418,22 @@ class SpeedTestApp:
         dl = r.get("download", 0)
         ul = r.get("upload", 0)
         ping = r.get("ping", 0)
-        src = r.get("download_source", "—")
+        src = r.get("source", "—")
 
-        if dl >= 100:
+        if dl >= 500:
+            grade = "★★★★★ 极速"
+        elif dl >= 200:
             grade = "★★★★★ 优秀"
-        elif dl >= 50:
+        elif dl >= 100:
             grade = "★★★★ 良好"
+        elif dl >= 50:
+            grade = "★★★ 不错"
         elif dl >= 20:
-            grade = "★★★ 一般"
+            grade = "★★ 一般"
         elif dl >= 5:
-            grade = "★★ 较慢"
+            grade = "★ 较慢"
         else:
-            grade = "★ 很慢"
+            grade = " 很慢"
 
         return f"""╔══════════════════════════════════════╗
 ║         网络测速总结报告
