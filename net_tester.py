@@ -292,11 +292,23 @@ class SpeedTestApp:
         self.dpi_scale = 1.0
         try:
             import ctypes
+            # 让 Windows 感知 DPI（否则 tkinter 会被虚拟化导致模糊）
+            try:
+                ctypes.windll.shcore.SetProcessDpiAwareness(2)  # PER_MONITOR_AWARE
+            except Exception:
+                try:
+                    ctypes.windll.user32.SetProcessDPIAware()
+                except Exception:
+                    pass
+
             hdc = ctypes.windll.user32.GetDC(0)
             dpi = ctypes.windll.gdi32.GetDeviceCaps(hdc, 88)
             ctypes.windll.user32.ReleaseDC(0, hdc)
             if dpi > 96:
                 self.dpi_scale = dpi / 96.0
+
+            # 让 tkinter 也按 DPI 缩放
+            self.root.tk.call("tk", "scaling", self.dpi_scale * 96 / 72)
         except Exception:
             pass
 
