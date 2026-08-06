@@ -67,22 +67,41 @@ def measure_ping(host, port=443, count=5, timeout=5):
 
 
 def probe_source(name, url, timeout=PROBE_TIMEOUT):
-    """探测一个源：下载前 1MB，测延迟和初步速度"""
+    """探测一个源：TCP 连接测延迟 + 下载 1MB 确认可达
+    
+    返回 (name, 下载字节数, TCP延迟ms)
+    """
     try:
-        start = time.time()
+        # 从 URL 提取 host
+        from urllib.parse import urlparse
+        parsed = urlparse(url)
+        host = parsed.hostname
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+
+        # TCP 连接测纯延迟
+        tcp_latencies = []
+        for _ in range(3):
+            try:
+                start = time.time()
+                sock = socket.create_connection((host, port), timeout=timeout)
+                lat = (time.time() - start) * 1000
+                sock.close()
+                tcp_latencies.append(lat)
+            except Exception:
+                pass
+        latency_ms = sum(tcp_latencies) / len(tcp_latencies) if tcp_latencies else 99999
+
+        # 下载 1MB 确认可达
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0", "Range": "bytes=0-1048575"})
         with urllib.request.urlopen(req, timeout=timeout, context=_ctx) as resp:
             data = resp.read(1048576)
-        elapsed = time.time() - start
-        if elapsed < 0.05:
-            return name, 0, elapsed * 1000  # 太快，延迟极低
-        return name, len(data), elapsed * 1000
+        return name, len(data), latency_ms
     except Exception:
         return name, 0, 99999
 
 
 def select_best_source(sources, callback=None):
-    """探测所有源，选延迟最低的"""
+    """探测所有源，返回所有可达源 [(name, url, latency_ms), ...]"""
     results = []
     for name, url in sources:
         if callback:
@@ -96,13 +115,7 @@ def select_best_source(sources, callback=None):
             if callback:
                 callback(f"{name}: 不可达")
 
-    if not results:
-        return None, None, 0
-
-    # 按延迟排序，选最快的
-    results.sort(key=lambda x: x[2])
-    best = results[0]
-    return best[0], best[1], best[2]
+    return results
 
 
 class TimedDownloader(threading.Thread):
@@ -280,8 +293,11 @@ class SpeedTestApp:
         self.root.resizable(False, False)
 
         self.root.update_idletasks()
-        x = (self.root.winfo_screenwidth() - self.W) // 2
-        y = (self.root.winfo_screenheight() - self.H) // 3
+        # 用实际可用屏幕区域居中（排除任务栏）
+        sw = self.root.winfo_screenwidth()
+        sh = self.root.winfo_screenheight()
+        x = max(0, (sw - self.W) // 2)
+        y = max(0, (sh - self.H) // 2 - self.scale(30))  # 略偏上，但不超出屏幕
         self.root.geometry(f"{self.W}x{self.H}+{x}+{y}")
 
         self.is_testing = False
@@ -337,11 +353,8 @@ class SpeedTestApp:
         self.upload_var = tk.StringVar(value="上传速度：—")
         ttk.Label(frame, textvariable=self.upload_var, font=self._font(13)).pack(anchor="w", pady=self.scale(2))
 
-        self.ping_var = tk.StringVar(value="延迟：—")
-        ttk.Label(frame, textvariable=self.ping_var, font=self._font(13)).pack(anchor="w", pady=self.scale(2))
-
-        self.server_var = tk.StringVar(value="最佳节点：—")
-        ttk.Label(frame, textvariable=self.server_var, font=self._font(10), foreground="gray").pack(anchor="w", pady=self.scale(2))
+        self.server_var = tk.StringVar(value="节点延迟：—")
+        ttk.Label(frame, textvariable=self.server_var, font=self._font(11), foreground="gray").pack(anchor="w", pady=self.scale(2))
 
         self.realtime_var = tk.StringVar(value="")
         ttk.Label(self.root, textvariable=self.realtime_var, font=self._font(9), foreground="blue").pack(pady=self.scale(3))
@@ -365,8 +378,7 @@ class SpeedTestApp:
         self.progress["value"] = 0
         self.download_var.set("下载速度：等待中")
         self.upload_var.set("上传速度：等待中")
-        self.ping_var.set("延迟：等待中")
-        self.server_var.set("最佳节点：—")
+        self.server_var.set("节点延迟：—")
         self.realtime_var.set("")
         self._set_report("")
         threading.Thread(target=self._run_test, daemon=True).start()
@@ -374,34 +386,26 @@ class SpeedTestApp:
     def _run_test(self):
         results = {}
         try:
-            # 1. 探测选源
-            self._update_status("正在探测最优节点")
+            # 1. 探测所有源
+            self._update_status("正在探测测速节点")
             self._start_dots("探测中")
             self._update_progress(5)
 
-            best_name, best_url, probe_latency = select_best_source(DOWNLOAD_SOURCES, callback=self._update_realtime)
+            reachable = select_best_source(DOWNLOAD_SOURCES, callback=self._update_realtime)
 
-            if best_name is None:
+            if not reachable:
                 self._update_status("所有节点不可达，请检查网络")
                 self._stop_dots()
                 return
 
-            self._update("server", f"最佳节点：{best_name}（延迟 {probe_latency:.0f}ms）")
-            results["source"] = best_name
+            # 显示所有节点延迟
+            node_info = " / ".join(f"{n} {lat:.0f}ms" for n, _, lat in reachable)
+            self._update("server", f"节点延迟：{node_info}")
+            results["nodes"] = node_info
             self._update_progress(15)
             self._stop_dots()
 
-            # 2. 延迟
-            self._update_status("正在测试网络延迟")
-            self._start_dots("测试延迟中")
-            # 用探测到的延迟即可
-            ping = measure_ping("mirrors.huaweicloud.com" if "huaweicloud" in best_url else "dldir1.qq.com", 443, 5, timeout=5)
-            results["ping"] = ping if ping > 0 else probe_latency
-            self._update("ping", f"延迟：{results['ping']:.0f} ms")
-            self._update_progress(20)
-            self._stop_dots()
-
-            # 3. 下载测速——多 URL 多线程持续 10 秒
+            # 2. 下载测速——多 URL 多线程持续 10 秒
             self._update_status(f"正在测试下载速度（{DOWNLOAD_DURATION}秒）")
             self._update("download", "下载速度：测试中")
             self._start_dots("下载测速中")
@@ -451,8 +455,7 @@ class SpeedTestApp:
         now = time.strftime("%Y-%m-%d %H:%M:%S")
         dl = r.get("download", 0)
         ul = r.get("upload", 0)
-        ping = r.get("ping", 0)
-        src = r.get("source", "—")
+        nodes = r.get("nodes", "—")
 
         if dl >= 500:
             grade = "★★★★★ 极速"
@@ -473,11 +476,10 @@ class SpeedTestApp:
 ║         网络测速总结报告
 ╠══════════════════════════════════════╣
   测试时间：{now}
-  最佳节点：{src}
+  节点延迟：{nodes}
 
   下载速度：{dl:.2f} Mbps（{dl/8:.1f} MB/s）
   上传速度：{ul:.2f} Mbps（{ul/8:.1f} MB/s）
-  网络延迟：{ping:.0f} ms
 
   综合评级：{grade}
 ╚══════════════════════════════════════╝"""
@@ -489,7 +491,7 @@ class SpeedTestApp:
         self.root.after(0, lambda: self.progress.config(value=value))
 
     def _update(self, key, text):
-        m = {"download": self.download_var, "upload": self.upload_var, "ping": self.ping_var, "server": self.server_var}
+        m = {"download": self.download_var, "upload": self.upload_var, "server": self.server_var}
         if key in m:
             self.root.after(0, lambda: m[key].set(text))
 
