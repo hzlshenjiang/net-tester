@@ -274,14 +274,14 @@ class SpeedTestApp:
         self.root.title("网速测试工具")
 
         self._setup_dpi()
-        self.W = self.scale(560)
-        self.H = self.scale(640)
+        self.W = self.scale(580)
+        self.H = self.scale(700)
         self.root.geometry(f"{self.W}x{self.H}")
         self.root.resizable(False, False)
 
         self.root.update_idletasks()
         x = (self.root.winfo_screenwidth() - self.W) // 2
-        y = (self.root.winfo_screenheight() - self.H) // 2
+        y = (self.root.winfo_screenheight() - self.H) // 3
         self.root.geometry(f"{self.W}x{self.H}+{x}+{y}")
 
         self.is_testing = False
@@ -350,12 +350,12 @@ class SpeedTestApp:
         self.btn_start.pack(pady=self.scale(8))
 
         self.report_text = tk.Text(
-            self.root, height=11, width=62,
-            font=("Consolas", self.scale(9)),
+            self.root, height=13, width=66,
+            font=("Consolas", self.scale(10)),
             state="disabled", wrap="word", relief="flat",
             background=self.root.cget("background"),
         )
-        self.report_text.pack(padx=self.scale(30), pady=(self.scale(3), self.scale(10)))
+        self.report_text.pack(padx=self.scale(20), pady=(self.scale(3), self.scale(10)))
 
     def start_test(self):
         if self.is_testing:
@@ -475,8 +475,8 @@ class SpeedTestApp:
   测试时间：{now}
   最佳节点：{src}
 
-  下载速度：{dl:.2f} Mbps
-  上传速度：{ul:.2f} Mbps
+  下载速度：{dl:.2f} Mbps（{dl/8:.1f} MB/s）
+  上传速度：{ul:.2f} Mbps（{ul/8:.1f} MB/s）
   网络延迟：{ping:.0f} ms
 
   综合评级：{grade}
