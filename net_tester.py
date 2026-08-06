@@ -408,12 +408,11 @@ class SpeedTestApp:
 
             # 用所有可达源（不只最优源），多 URL 并行突破 CDN 单 IP 限速
             all_urls = [url for _, url in DOWNLOAD_SOURCES]
-            total_bytes, dl_speed = measure_download_timed(all_urls, duration=DOWNLOAD_DURATION, threads_per_url=8, callback=self._update_realtime)
+            total_bytes, dl_speed = measure_download_timed(all_urls, duration=DOWNLOAD_DURATION, threads_per_url=8, callback=None)
 
             self._stop_dots()
             results["download"] = dl_speed
             self._update("download", f"下载速度：{dl_speed:.2f} Mbps")
-            self._update_realtime(f"下载完成: {total_bytes/1_000_000:.1f}MB / {DOWNLOAD_DURATION}s = {dl_speed:.2f} Mbps")
             self._update_progress(60)
 
             # 4. 上传测速——持续 10 秒
@@ -421,12 +420,13 @@ class SpeedTestApp:
             self._update("upload", "上传速度：测试中")
             self._start_dots("上传测速中")
 
-            total_up, ul_speed = measure_upload_timed(UPLOAD_URL, duration=UPLOAD_DURATION, threads=8, callback=self._update_realtime)
+            total_up, ul_speed = measure_upload_timed(UPLOAD_URL, duration=UPLOAD_DURATION, threads=8, callback=None)
 
             # 如果 8 线程上传偏低，自动加到 12 线程重试一次
             if ul_speed < 10:
+                self._stop_dots()
                 self._update_realtime(f"上传 {ul_speed:.0f} Mbps 偏低，12 线程重试...")
-                total_up, ul_speed = measure_upload_timed(UPLOAD_URL, duration=UPLOAD_DURATION, threads=12, callback=self._update_realtime)
+                total_up, ul_speed = measure_upload_timed(UPLOAD_URL, duration=UPLOAD_DURATION, threads=12, callback=None)
 
             self._stop_dots()
             results["upload"] = ul_speed
