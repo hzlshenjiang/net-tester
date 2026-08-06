@@ -344,7 +344,7 @@ class SpeedTestApp:
         self.progress = ttk.Progressbar(self.root, orient="horizontal", length=self.scale(460), mode="determinate")
         self.progress.pack(pady=self.scale(8))
 
-        frame = ttk.LabelFrame(self.root, text="测试结果", padding=self.scale(12))
+        frame = ttk.LabelFrame(self.root, text="测试现况", padding=self.scale(12))
         frame.pack(fill="x", padx=self.scale(30), pady=self.scale(5))
 
         self.download_var = tk.StringVar(value="下载速度：—")
@@ -353,9 +353,6 @@ class SpeedTestApp:
         self.upload_var = tk.StringVar(value="上传速度：—")
         ttk.Label(frame, textvariable=self.upload_var, font=self._font(13)).pack(anchor="w", pady=self.scale(2))
 
-        self.server_var = tk.StringVar(value="节点延迟：—")
-        ttk.Label(frame, textvariable=self.server_var, font=self._font(11), foreground="gray").pack(anchor="w", pady=self.scale(2))
-
         self.realtime_var = tk.StringVar(value="")
         ttk.Label(self.root, textvariable=self.realtime_var, font=self._font(9), foreground="blue").pack(pady=self.scale(3))
 
@@ -363,7 +360,7 @@ class SpeedTestApp:
         self.btn_start.pack(pady=self.scale(8))
 
         self.report_text = tk.Text(
-            self.root, height=13, width=66,
+            self.root, height=15, width=66,
             font=("Consolas", self.scale(10)),
             state="disabled", wrap="word", relief="flat",
             background=self.root.cget("background"),
@@ -378,7 +375,6 @@ class SpeedTestApp:
         self.progress["value"] = 0
         self.download_var.set("下载速度：等待中")
         self.upload_var.set("上传速度：等待中")
-        self.server_var.set("节点延迟：—")
         self.realtime_var.set("")
         self._set_report("")
         threading.Thread(target=self._run_test, daemon=True).start()
@@ -398,9 +394,9 @@ class SpeedTestApp:
                 self._stop_dots()
                 return
 
-            # 显示所有节点延迟
+            # 显示节点延迟到实时区域
             node_info = " / ".join(f"{n} {lat:.0f}ms" for n, _, lat in reachable)
-            self._update("server", f"节点延迟：{node_info}")
+            self._update_realtime(f"节点延迟：{node_info}")
             results["nodes"] = node_info
             self._update_progress(15)
             self._stop_dots()
@@ -491,7 +487,7 @@ class SpeedTestApp:
         self.root.after(0, lambda: self.progress.config(value=value))
 
     def _update(self, key, text):
-        m = {"download": self.download_var, "upload": self.upload_var, "server": self.server_var}
+        m = {"download": self.download_var, "upload": self.upload_var}
         if key in m:
             self.root.after(0, lambda: m[key].set(text))
 
