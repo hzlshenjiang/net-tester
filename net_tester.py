@@ -516,8 +516,23 @@ class SpeedTestApp:
         self.root.after(0, _do)
 
 
+def _app_icon_path():
+    if getattr(sys, "frozen", False):
+        base = sys._MEIPASS
+    else:
+        base = os.path.dirname(os.path.abspath(__file__))
+    p = os.path.join(base, "icon.ico")
+    return p if os.path.isfile(p) else None
+
+
 def main():
     root = tk.Tk()
+    icon = _app_icon_path()
+    if icon:
+        try:
+            root.iconbitmap(icon)
+        except Exception:
+            pass
     app = SpeedTestApp(root)
     root.mainloop()
 

@@ -27,7 +27,7 @@
 ## 构建
 
 ```bash
-python -m PyInstaller --onefile --windowed --name NetTester net_tester.py
+python -m PyInstaller --onefile --windowed --name NetTester --icon icon.ico --add-data "icon.ico;." net_tester.py
 ```
 
 ## License
