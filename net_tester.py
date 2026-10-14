@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """网络测速工具 - 绿色版
 
-测速方案（参考 speedtest-cli 核心逻辑，针对国内优化）：
+测速方案（参考 speedtest-cli / cfspeed 思路，针对国内优化）：
 1. 探测选源：小文件下载测延迟，选最快的 CDN
 2. 下载测速：多线程持续下载 10 秒，取总吞吐量
-3. 上传测速：POST 大数据 10 秒，取吞吐量
+3. 上传测速：http.client 多连接连续 POST 大包（类 cfspeed），取吞吐量
 4. 延迟：TCP 连接测延迟
 
-支持高带宽（千兆）：按时间截断而非固定大小，TCP 充分爬坡。
+仪表盘显示真实累计吞吐，不做假平滑过滤。
 """
 
 import tkinter as tk
@@ -19,7 +19,9 @@ import sys
 import ssl
 import socket
 import math
+import http.client
 import urllib.request
+from urllib.parse import urlparse
 from queue import Queue
 
 
@@ -40,7 +42,7 @@ DOWNLOAD_SOURCES = [
     ("腾讯-微信", "https://dldir1.qq.com/weixin/Windows/WeChatSetup.exe"),
 ]
 
-# 上传端点
+# 上传端点（Cloudflare 公开测速，与 cfspeed / speed.cloudflare.com 相同）
 UPLOAD_URL = "https://speed.cloudflare.com/__up"
 
 # 测速持续时间（秒）
@@ -51,27 +53,17 @@ PROBE_TIMEOUT = 3
 
 
 class ByteAccumulator:
-    """线程安全的字节累计器，供仪表盘读取近窗口速度"""
-
-    # 近窗口：反映“此刻吞吐”，不会像总均速那样从 0 慢慢爬
-    WINDOW_SEC = 1.2
-    MIN_WINDOW_SEC = 0.35
-    # 下载开局极短窗口容易虚高，要求至少攒到这么久才报窗口速度
-    DOWNLOAD_MIN_ELAPSED = 0.5
+    """线程安全的字节累计器——只提供真实累计吞吐，不做假过滤"""
 
     def __init__(self):
         self._lock = threading.Lock()
         self.total = 0
-        self._window = []  # (timestamp, bytes)
-        self._t0 = None            # reset 时刻（含建连空窗）
-        self._first_byte_t = None  # 真正开始传数据的时刻
-        self._last_byte_t = None   # 最后一次记账时刻
+        self._first_byte_t = None
+        self._last_byte_t = None
 
     def reset(self):
         with self._lock:
             self.total = 0
-            self._window = []
-            self._t0 = time.time()
             self._first_byte_t = None
             self._last_byte_t = None
 
@@ -80,31 +72,20 @@ class ByteAccumulator:
             return
         now = time.time()
         with self._lock:
-            if self._t0 is None:
-                self._t0 = now
             if self._first_byte_t is None:
                 self._first_byte_t = now
             self._last_byte_t = now
             self.total += n
-            self._window.append((now, n))
-            cutoff = now - self.WINDOW_SEC
-            self._window = [(t, b) for t, b in self._window if t >= cutoff]
-
-    def elapsed(self):
-        with self._lock:
-            if self._t0 is None:
-                return 0.0
-            return max(time.time() - self._t0, 0.0)
 
     def transfer_elapsed(self):
-        """首字节→末字节的传输时长（排除建连空窗与收尾等待）"""
+        """首字节→末字节"""
         with self._lock:
             if self._first_byte_t is None or self._last_byte_t is None:
                 return 0.0
             return max(self._last_byte_t - self._first_byte_t, 0.0)
 
     def average_mbps(self):
-        """从首字节到现在的平均速度（Mbps），不含建连等待"""
+        """自首字节起的真实累计吞吐（Mbps）"""
         now = time.time()
         with self._lock:
             if self._first_byte_t is None or self.total <= 0:
@@ -112,41 +93,16 @@ class ByteAccumulator:
             elapsed = max(now - self._first_byte_t, 0.001)
             return self.total / elapsed * 8 / 1_000_000
 
-    def window_mbps(self):
-        """近 1.2 秒窗口吞吐（Mbps）——仪表盘主数据源"""
-        now = time.time()
+    def live_mbps(self):
+        """给仪表盘的真实读数：样本不足时先为 0，够了就报累计吞吐"""
         with self._lock:
-            if not self._window:
+            if self._first_byte_t is None or self.total <= 0:
                 return 0.0
-            cutoff = now - self.WINDOW_SEC
-            recent = [(t, b) for t, b in self._window if t >= cutoff]
-            if not recent:
-                return 0.0
-            w_elapsed = max(now - recent[0][0], self.MIN_WINDOW_SEC)
-            return sum(b for _, b in recent) / w_elapsed * 8 / 1_000_000
-
-    def display_mbps(self, prefer_average=False):
-        """仪表盘速度：默认近窗口；下载开局略加均速抑制虚高"""
-        win = self.window_mbps()
-        avg = self.average_mbps()
-        te = self.transfer_elapsed()
-
-        if prefer_average:
-            # 上传：近窗口为主；均速在极短时长会虚高，前 0.8s 只用窗口
-            if win <= 0:
-                return 0.0
-            if te < 0.8:
-                return win
-            return win * 0.85 + avg * 0.15
-
-        # 下载：还没传够半秒先报 0，避免指针虚冲
-        if te < self.DOWNLOAD_MIN_ELAPSED:
+            elapsed = time.time() - self._first_byte_t
+        # 不足 0.25s 样本太少，不算“造假”，只是还没形成有效成绩
+        if elapsed < 0.25:
             return 0.0
-        if win <= 0:
-            return avg
-        if te < 2.0:
-            return win * 0.45 + avg * 0.55
-        return win * 0.7 + avg * 0.3
+        return self.average_mbps()
 
 
 def measure_ping(host, port=443, count=5, timeout=5):
@@ -172,13 +128,10 @@ def probe_source(name, url, timeout=PROBE_TIMEOUT):
     返回 (name, 下载字节数, TCP延迟ms)
     """
     try:
-        # 从 URL 提取 host
-        from urllib.parse import urlparse
         parsed = urlparse(url)
         host = parsed.hostname
         port = parsed.port or (443 if parsed.scheme == "https" else 80)
 
-        # TCP 连接测纯延迟
         tcp_latencies = []
         for _ in range(3):
             try:
@@ -191,7 +144,6 @@ def probe_source(name, url, timeout=PROBE_TIMEOUT):
                 pass
         latency_ms = sum(tcp_latencies) / len(tcp_latencies) if tcp_latencies else 99999
 
-        # 下载 1MB 确认可达
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0", "Range": "bytes=0-1048575"})
         with urllib.request.urlopen(req, timeout=timeout, context=_ctx) as resp:
             data = resp.read(1048576)
@@ -200,10 +152,12 @@ def probe_source(name, url, timeout=PROBE_TIMEOUT):
         return name, 0, 99999
 
 
-def select_best_source(sources, callback=None):
+def select_best_source(sources, callback=None, stop_event=None):
     """探测所有源，返回所有可达源 [(name, url, latency_ms), ...]"""
     results = []
     for name, url in sources:
+        if stop_event is not None and stop_event.is_set():
+            break
         if callback:
             callback(f"探测 {name}...")
         _, size, latency_ms = probe_source(name, url)
@@ -214,24 +168,27 @@ def select_best_source(sources, callback=None):
         else:
             if callback:
                 callback(f"{name}: 不可达")
-
     return results
 
 
 class TimedDownloader(threading.Thread):
     """按时间下载——持续下载指定秒数，统计总字节数"""
 
-    def __init__(self, url, duration, result_queue, thread_id, accumulator=None):
+    def __init__(self, url, duration, result_queue, thread_id, accumulator=None, stop_event=None):
         super().__init__(daemon=True)
         self.url = url
         self.duration = duration
         self.result_queue = result_queue
         self.thread_id = thread_id
         self.accumulator = accumulator
+        self.stop_event = stop_event
         self._should_stop = False
 
     def stop(self):
         self._should_stop = True
+
+    def _stopped(self):
+        return self._should_stop or (self.stop_event is not None and self.stop_event.is_set())
 
     def run(self):
         total_bytes = 0
@@ -239,7 +196,7 @@ class TimedDownloader(threading.Thread):
         try:
             req = urllib.request.Request(self.url, headers={"User-Agent": "Mozilla/5.0"})
             with urllib.request.urlopen(req, timeout=self.duration + 5, context=_ctx) as resp:
-                while not self._should_stop and (time.time() - start) < self.duration:
+                while not self._stopped() and (time.time() - start) < self.duration:
                     chunk = resp.read(131072)  # 128KB
                     if not chunk:
                         break
@@ -253,18 +210,11 @@ class TimedDownloader(threading.Thread):
 
 
 def measure_download_timed(urls, duration=DOWNLOAD_DURATION, threads_per_url=8,
-                           callback=None, progress_callback=None):
-    """多 URL 多线程持续下载，返回 (总字节, 速度Mbps)
-
-    urls 可以是单个 URL 字符串或 URL 列表。
-    每个 URL 开 threads_per_url 个线程，总线程数 = len(urls) * threads_per_url。
-    自适应：单 URL 时开 12 线程，多 URL 时每 URL 开 8 线程。
-    progress_callback(mbps) 约每 100ms 回调一次瞬时速度。
-    """
+                           callback=None, progress_callback=None, stop_event=None):
+    """多 URL 多线程持续下载，返回 (总字节, 速度Mbps)"""
     if isinstance(urls, str):
         urls = [urls]
 
-    # 自适应线程数：确保总线程 16-24 之间
     if len(urls) == 1:
         threads_per_url = 12
     total_threads = len(urls) * threads_per_url
@@ -274,34 +224,31 @@ def measure_download_timed(urls, duration=DOWNLOAD_DURATION, threads_per_url=8,
     q = Queue()
     workers = []
     for url in urls:
-        for i in range(threads_per_url):
-            t = TimedDownloader(url, duration, q, len(workers), accumulator=acc)
+        for _ in range(threads_per_url):
+            t = TimedDownloader(
+                url, duration, q, len(workers),
+                accumulator=acc, stop_event=stop_event,
+            )
             workers.append(t)
             t.start()
 
     if callback:
         callback(f"下载中: {len(urls)}个源 × {threads_per_url}线程 = {total_threads}连接")
 
-    # 近窗口速度 + 轻度 EMA；下载开局由 display_mbps 自己抑制虚高
-    deadline = time.time() + duration + 10
-    ema = 0.0
-    ema_ready = False
-    while any(t.is_alive() for t in workers) and time.time() < deadline:
+    t_end = time.time() + duration
+    while time.time() < t_end:
+        if stop_event is not None and stop_event.is_set():
+            break
         if progress_callback:
-            raw = acc.display_mbps(prefer_average=False)
-            if raw <= 0 and not ema_ready:
-                progress_callback(0.0)
-            else:
-                if not ema_ready:
-                    ema = raw
-                    ema_ready = True
-                else:
-                    ema = ema * 0.55 + raw * 0.45
-                progress_callback(ema)
+            # 真实累计吞吐，无 EMA / 假保持
+            progress_callback(acc.live_mbps())
         time.sleep(0.1)
 
     for t in workers:
-        t.join(timeout=2)
+        t.stop()
+    join_deadline = time.time() + 2
+    for t in workers:
+        t.join(timeout=max(join_deadline - time.time(), 0.05))
 
     total_bytes = 0
     max_elapsed = 0
@@ -310,147 +257,134 @@ def measure_download_timed(urls, duration=DOWNLOAD_DURATION, threads_per_url=8,
         total_bytes += bytes_down
         max_elapsed = max(max_elapsed, elapsed)
 
-    if max_elapsed < 0.5:
-        return 0, 0
-
-    speed_mbps = total_bytes / max_elapsed * 8 / 1_000_000
-    return total_bytes, speed_mbps
-
-
-class UploadStream:
-    """可被 urllib 边读边发的上传体：按块记账，到点停止（避免大包拖死时长）"""
-
-    def __init__(self, total_size, chunk_size, accumulator, end_time=None):
-        self.total_size = total_size
-        self.sent = 0
-        self.chunk = b"0" * chunk_size
-        self.accumulator = accumulator
-        self.end_time = end_time
-
-    def read(self, size=-1):
-        # 到点立即停，宁可连接报错，也不让单请求拖到十几秒
-        if self.end_time is not None and time.time() >= self.end_time:
-            return b""
-        if self.sent >= self.total_size:
-            return b""
-        if size is None or size < 0:
-            size = len(self.chunk)
-        n = min(size, self.total_size - self.sent, len(self.chunk))
-        if n <= 0:
-            return b""
-        self.sent += n
-        if self.accumulator:
-            self.accumulator.add(n)
-        return self.chunk[:n]
+    transfer_secs = acc.transfer_elapsed()
+    if transfer_secs >= 0.5 and total_bytes > 0:
+        return total_bytes, total_bytes / transfer_secs * 8 / 1_000_000
+    if max_elapsed >= 0.5 and total_bytes > 0:
+        return total_bytes, total_bytes / max_elapsed * 8 / 1_000_000
+    return 0, 0
 
 
-class TimedUploader(threading.Thread):
-    """按时间上传——1MB 流式 POST，边发边记账，到点截断"""
+class ContinuousUploader(threading.Thread):
+    """单连接连续上传大包（参考 cfspeed：并行流 + 大 payload）
 
-    # 实测：4MB 包在中低上行会拖过测试时长且出字节更晚；1MB 更稳
-    PAYLOAD_SIZE = 1 * 1024 * 1024
-    READ_CHUNK = 64 * 1024
+    用 http.client 直接 send，避免 urllib 反复建短请求造成吞吐起伏。
+    Content-Length 按整段测速时长预留，到点关连接，字节按实际 send 累计。
+    """
 
-    def __init__(self, url, duration, result_queue, thread_id, accumulator=None):
+    CHUNK = 256 * 1024  # 256KB
+    # 预留上限：按 2Gbps × 时长，保证单次 POST 覆盖整段测试
+    MAX_BPS = 2_000_000_000
+
+    def __init__(self, url, duration, result_queue, thread_id, accumulator=None, stop_event=None):
         super().__init__(daemon=True)
         self.url = url
         self.duration = duration
         self.result_queue = result_queue
         self.thread_id = thread_id
         self.accumulator = accumulator
+        self.stop_event = stop_event
         self._should_stop = False
+        self._conn = None
 
     def stop(self):
         self._should_stop = True
+        conn = self._conn
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    def _stopped(self):
+        return self._should_stop or (self.stop_event is not None and self.stop_event.is_set())
 
     def run(self):
+        parsed = urlparse(self.url)
+        host = parsed.hostname
+        port = parsed.port or 443
+        path = parsed.path or "/__up"
+        if parsed.query:
+            path = f"{path}?{parsed.query}"
+
         total_bytes = 0
         start = time.time()
         end_time = start + self.duration
+        chunk = b"0" * self.CHUNK
+        payload_cap = max(int(self.MAX_BPS / 8 * self.duration), self.CHUNK * 16)
+
         try:
-            while not self._should_stop and time.time() < end_time:
-                remain = end_time - time.time()
-                # 剩余不够发完一整包就停：中途截断会和 Content-Length 打架导致空等超时
-                if remain < 2.0:
-                    break
-                body = UploadStream(
-                    self.PAYLOAD_SIZE, self.READ_CHUNK,
-                    self.accumulator, end_time=None,
-                )
-                req = urllib.request.Request(
-                    self.url, data=body,
-                    headers={
-                        "User-Agent": "Mozilla/5.0",
-                        "Content-Type": "application/octet-stream",
-                        "Content-Length": str(self.PAYLOAD_SIZE),
-                    },
-                    method="POST",
-                )
+            while not self._stopped() and time.time() < end_time:
+                conn = None
                 try:
-                    with urllib.request.urlopen(req, timeout=15, context=_ctx) as resp:
-                        resp.read()
-                    total_bytes += body.sent
+                    if self._stopped() or time.time() >= end_time:
+                        break
+                    # 超时随剩余时长收缩，便于停止时尽快返回
+                    remain_time = max(end_time - time.time(), 1.0)
+                    conn = http.client.HTTPSConnection(
+                        host, port, context=_ctx, timeout=min(12.0, remain_time + 3.0),
+                    )
+                    self._conn = conn
+                    remain = payload_cap
+                    conn.putrequest("POST", path)
+                    conn.putheader("User-Agent", "Mozilla/5.0")
+                    conn.putheader("Content-Type", "application/octet-stream")
+                    conn.putheader("Content-Length", str(remain))
+                    conn.endheaders()
+
+                    while not self._stopped() and time.time() < end_time and remain > 0:
+                        n = min(len(chunk), remain)
+                        conn.send(chunk[:n])
+                        remain -= n
+                        total_bytes += n
+                        if self.accumulator:
+                            self.accumulator.add(n)
                 except Exception:
-                    total_bytes += body.sent
-                if time.time() >= end_time or self._should_stop:
-                    break
+                    # 连接被掐断则重连继续，直到时长结束——真实网络重试
+                    if self._stopped() or time.time() >= end_time:
+                        break
+                    time.sleep(0.05)
+                finally:
+                    self._conn = None
+                    if conn is not None:
+                        try:
+                            conn.close()
+                        except Exception:
+                            pass
         except Exception:
             pass
-        elapsed = time.time() - start
-        self.result_queue.put((self.thread_id, total_bytes, elapsed))
+
+        self.result_queue.put((self.thread_id, total_bytes, time.time() - start))
 
 
 def measure_upload_timed(url, duration=UPLOAD_DURATION, threads=8,
-                         callback=None, progress_callback=None):
-    """多线程持续上传，返回速度 Mbps"""
+                         callback=None, progress_callback=None, stop_event=None):
+    """多连接连续上传，返回 (总字节, 速度Mbps)"""
     acc = ByteAccumulator()
     acc.reset()
     q = Queue()
     workers = []
-    t_start = time.time()
-    t_end = t_start + duration
+    t_end = time.time() + duration
+
     for i in range(threads):
-        t = TimedUploader(url, duration, q, i, accumulator=acc)
+        t = ContinuousUploader(
+            url, duration, q, i,
+            accumulator=acc, stop_event=stop_event,
+        )
         workers.append(t)
         t.start()
 
-    ema = 0.0
-    ema_ready = False
-    last_good = 0.0
-    last_good_t = 0.0
-    # 进度只跟到正式时长；之后保峰值，不再因窗口清空掉到 0
     while time.time() < t_end:
+        if stop_event is not None and stop_event.is_set():
+            break
         if progress_callback:
-            raw = acc.display_mbps(prefer_average=True)
-            now = time.time()
-            # 请求间隙窗口可能短暂为 0：短时保持上次好值，避免指针掉零
-            if raw > 0.5:
-                last_good = raw
-                last_good_t = now
-                sample = raw
-            elif last_good_t and (now - last_good_t) < 0.7:
-                sample = last_good
-            else:
-                sample = 0.0
-
-            if sample <= 0 and not ema_ready:
-                progress_callback(0.0)
-            else:
-                if not ema_ready:
-                    ema = sample
-                    ema_ready = True
-                else:
-                    # 跟上峰值要快，不能那种“从 0 慢慢爬”
-                    ema = ema * 0.5 + sample * 0.5
-                progress_callback(ema)
+            # 真实累计吞吐，绝不做 hold-last / EMA 造假
+            progress_callback(acc.live_mbps())
         time.sleep(0.1)
 
-    # 到点：钉住最后读数，并通知线程收工
-    if progress_callback and ema_ready:
-        progress_callback(ema)
     for t in workers:
         t.stop()
-    join_deadline = time.time() + 3
+    join_deadline = time.time() + 2
     for t in workers:
         t.join(timeout=max(join_deadline - time.time(), 0.05))
 
@@ -461,16 +395,12 @@ def measure_upload_timed(url, duration=UPLOAD_DURATION, threads=8,
         total_bytes += bytes_up
         max_elapsed = max(max_elapsed, elapsed)
 
-    # 最终成绩按首字节→末字节，排除建连空窗
     transfer_secs = acc.transfer_elapsed()
     if transfer_secs >= 0.5 and total_bytes > 0:
-        speed_mbps = total_bytes / transfer_secs * 8 / 1_000_000
-    elif max_elapsed >= 0.5 and total_bytes > 0:
-        speed_mbps = total_bytes / max_elapsed * 8 / 1_000_000
-    else:
-        return 0, 0
-
-    return total_bytes, speed_mbps
+        return total_bytes, total_bytes / transfer_secs * 8 / 1_000_000
+    if max_elapsed >= 0.5 and total_bytes > 0:
+        return total_bytes, total_bytes / max_elapsed * 8 / 1_000_000
+    return 0, 0
 
 
 # ─── 动态省略号动画 ───
@@ -490,27 +420,28 @@ class DotAnimator:
     def stop(self):
         self.running = False
         if self._job:
-            self.root.after_cancel(self._job)
+            try:
+                self.root.after_cancel(self._job)
+            except Exception:
+                pass
+            self._job = None
 
     def _animate(self, dots):
         if not self.running:
             return
         self.label_var.set(self.base_text + "." * dots)
-        self._job = self.root.after(500, self._animate, (dots + 1) % 4)
+        self._job = self.root.after(400, self._animate, (dots + 1) % 4)
 
 
 # ─── 汽车仪表盘网速表 ───
 
 class SpeedGauge:
-    """汽车仪表盘式网速表：指针平滑扫动，显示实时 Mbps"""
+    """汽车仪表盘式网速表：数字显示真实值，指针快速跟上"""
 
-    # 默认按家用带宽常见区间铺满；超过再抬档
     SCALE_TIERS = (1000, 2000, 5000)
     DEFAULT_MAX = 1000.0
-    # 0~500Mbps 占表盘 72%（刻度疏），500~满量程占 28%（刻度密）
     LOW_BAND = 500.0
     LOW_SHARE = 0.72
-    # 指针扫过角度：从左下 225° 到右下 -45°（共 270°）
     START_ANGLE = 225.0
     SWEEP = 270.0
 
@@ -528,7 +459,7 @@ class SpeedGauge:
         self.max_mbps = self.DEFAULT_MAX
         self.target = 0.0
         self.current = 0.0
-        self.mode = ""  # 下载 / 上传 / 空
+        self.mode = ""
         self._anim_job = None
         self._cx = width / 2
         self._cy = height / 2 + self.scale(8)
@@ -544,6 +475,12 @@ class SpeedGauge:
         return self.SCALE_TIERS[-1]
 
     def reset(self):
+        if self._anim_job:
+            try:
+                self.canvas.after_cancel(self._anim_job)
+            except Exception:
+                pass
+            self._anim_job = None
         self.max_mbps = self.DEFAULT_MAX
         self.target = 0.0
         self.current = 0.0
@@ -551,34 +488,27 @@ class SpeedGauge:
         self._draw_static()
         self._draw_dynamic(0.0)
 
-    def set_mode(self, mode):
-        self.mode = mode or ""
-        self._draw_dynamic(self.current)
-
     def set_speed(self, mbps, mode=None):
-        """设置目标速度；指针用动画追赶"""
+        """设置真实速度；数字直接显示该值"""
         if mode is not None:
             self.mode = mode
         mbps = max(0.0, float(mbps))
-        # 量程随峰值抬升，但不频繁回落，避免指针乱跳
         need = self._tier_for(mbps)
         if need > self.max_mbps:
             self.max_mbps = float(need)
             self._draw_static()
         self.target = mbps
+        # 数字用真实值；指针快速追上（不做慢爬阻尼）
         if self._anim_job is None:
             self._tick()
 
     def speed_to_ratio(self, mbps):
-        """速度 → 表盘比例（非线性）：常用低速区占更大弧长"""
         mbps = max(0.0, float(mbps))
         max_s = self.max_mbps
         if max_s <= self.LOW_BAND:
             return min(mbps / max_s, 1.0) if max_s > 0 else 0.0
-
         if mbps <= self.LOW_BAND:
             return (mbps / self.LOW_BAND) * self.LOW_SHARE
-
         high = max_s - self.LOW_BAND
         if high <= 0:
             return 1.0
@@ -588,20 +518,16 @@ class SpeedGauge:
         return self.START_ANGLE - self.speed_to_ratio(mbps) * self.SWEEP
 
     def _major_tick_values(self):
-        """主刻度数值：0-500 疏，500 以上密"""
         max_s = int(self.max_mbps)
         ticks = [0, 50, 100, 200, 300, 400, 500]
         if max_s <= 500:
             return [t for t in ticks if t <= max_s] + ([max_s] if max_s not in ticks else [])
-
-        # 500 以上按量程补点，间距更紧
         if max_s <= 1000:
             ticks += [750, 1000]
         elif max_s <= 2000:
             ticks += [750, 1000, 1500, 2000]
         else:
             ticks += [750, 1000, 2000, 3500, 5000]
-        # 去重并裁到量程
         out = []
         for t in ticks:
             if t <= max_s and t not in out:
@@ -619,7 +545,6 @@ class SpeedGauge:
         c.delete("static")
         cx, cy, r = self._cx, self._cy, self._radius
 
-        # 外圈光晕
         c.create_oval(
             cx - r - self.scale(14), cy - r - self.scale(14),
             cx + r + self.scale(14), cy + r + self.scale(14),
@@ -630,15 +555,11 @@ class SpeedGauge:
             cx + r + self.scale(6), cy + r + self.scale(6),
             outline="#2a3d5c", width=self.scale(2), tags="static",
         )
-
-        # 背景弧轨
         self._create_arc(
             r, self.START_ANGLE, self.SWEEP,
             outline="#1a2336", width=self.scale(14), tags="static",
         )
 
-        # 色带按真实速度分段，再映射到非线性弧长
-        # 0-200 青绿 · 200-500 琥珀 · 500+ 玫红
         speed_zones = [
             (0.0, min(200.0, self.max_mbps), "#1ec8a5"),
             (min(200.0, self.max_mbps), min(500.0, self.max_mbps), "#f0a202"),
@@ -658,24 +579,18 @@ class SpeedGauge:
                 outline=color, width=self.scale(10), tags="static",
             )
 
-        # 主刻度（按速度值非线性落位）
         majors = self._major_tick_values()
         for i, val in enumerate(majors):
             ratio = self.speed_to_ratio(val)
             ang = self.START_ANGLE - ratio * self.SWEEP
             outer = self._polar(ang, r + self.scale(2))
             inner = self._polar(ang, r - self.scale(16))
-            c.create_line(
-                *inner, *outer,
-                fill="#dce6f5", width=self.scale(2), tags="static",
-            )
+            c.create_line(*inner, *outer, fill="#dce6f5", width=self.scale(2), tags="static")
             label_pos = self._polar(ang, r - self.scale(30))
             c.create_text(
                 *label_pos, text=str(int(val)),
-                fill="#9fb3d1", font=("Consolas", self.scale(8)),
-                tags="static",
+                fill="#9fb3d1", font=("Consolas", self.scale(8)), tags="static",
             )
-            # 相邻主刻度之间插小刻度
             if i < len(majors) - 1:
                 v0, v1 = majors[i], majors[i + 1]
                 steps = 4 if (v1 - v0) >= 100 else 2
@@ -685,19 +600,13 @@ class SpeedGauge:
                     aang = self.START_ANGLE - rr * self.SWEEP
                     o2 = self._polar(aang, r + self.scale(1))
                     i2 = self._polar(aang, r - self.scale(8))
-                    c.create_line(
-                        *i2, *o2, fill="#3d5270",
-                        width=self.scale(1), tags="static",
-                    )
+                    c.create_line(*i2, *o2, fill="#3d5270", width=self.scale(1), tags="static")
 
-        # 中心盖
         hub = self.scale(16)
         c.create_oval(
             cx - hub, cy - hub, cx + hub, cy + hub,
             fill="#151c2e", outline="#4a6fa5", width=self.scale(2), tags="static",
         )
-
-        # 标题
         c.create_text(
             cx, cy - r - self.scale(28),
             text="NET SPEED", fill="#5b7a9d",
@@ -705,8 +614,6 @@ class SpeedGauge:
         )
 
     def _create_arc(self, r, start_angle, extent, **kwargs):
-        """按数学角度画弧（Canvas 的 start 是 3 点钟方向逆时针）"""
-        # start_angle 是数学角，extent 是顺时针扫过的度数 → Canvas 用负 extent
         cx, cy = self._cx, self._cy
         self.canvas.create_arc(
             cx - r, cy - r, cx + r, cy + r,
@@ -714,21 +621,21 @@ class SpeedGauge:
             style="arc", **kwargs,
         )
 
-    def _draw_dynamic(self, mbps):
+    def _draw_dynamic(self, needle_mbps, text_mbps=None):
+        if text_mbps is None:
+            text_mbps = needle_mbps
         c = self.canvas
         c.delete("dyn")
         cx, cy, r = self._cx, self._cy, self._radius
-        ang = self._speed_to_angle(mbps)
+        ang = self._speed_to_angle(needle_mbps)
 
-        # 已走过的高亮弧（跟随非线性比例）
-        if mbps > 0.5:
-            ratio = self.speed_to_ratio(mbps)
+        if needle_mbps > 0.5:
+            ratio = self.speed_to_ratio(needle_mbps)
             self._create_arc(
                 r, self.START_ANGLE, ratio * self.SWEEP,
                 outline="#7ee8ff", width=self.scale(3), tags="dyn",
             )
 
-        # 指针
         tip = self._polar(ang, r - self.scale(22))
         base_l = self._polar(ang + 90, self.scale(5))
         base_r = self._polar(ang - 90, self.scale(5))
@@ -738,19 +645,16 @@ class SpeedGauge:
             tail[0], tail[1], base_r[0], base_r[1],
             fill="#ff6b35", outline="#ffd1bf", width=1, tags="dyn",
         )
-        # 针尖光点
         c.create_oval(
             tip[0] - 3, tip[1] - 3, tip[0] + 3, tip[1] + 3,
             fill="#fff0e6", outline="", tags="dyn",
         )
-        # 中心钉
         pin = self.scale(7)
         c.create_oval(
             cx - pin, cy - pin, cx + pin, cy + pin,
             fill="#ff6b35", outline="#ffffff", width=1, tags="dyn",
         )
 
-        # 模式与数字读数（与指针同一 current，保证一致）
         mode_text = self.mode if self.mode else "待机"
         mode_color = "#7ee8ff" if self.mode == "下载" else ("#f0a202" if self.mode == "上传" else "#6b7c93")
         c.create_text(
@@ -758,9 +662,10 @@ class SpeedGauge:
             text=mode_text, fill=mode_color,
             font=("Microsoft YaHei", self.scale(11), "bold"), tags="dyn",
         )
+        # 数字始终是真实回调值
         c.create_text(
             cx, cy + self.scale(72),
-            text=f"{mbps:.1f}", fill="#ffffff",
+            text=f"{text_mbps:.1f}", fill="#ffffff",
             font=("Consolas", self.scale(22), "bold"), tags="dyn",
         )
         c.create_text(
@@ -770,16 +675,15 @@ class SpeedGauge:
         )
 
     def _tick(self):
-        # 指数平滑追赶目标；上行稍快、下行稍慢，减少“先冲高再回落”的观感
         diff = self.target - self.current
-        if abs(diff) < 0.08:
+        if abs(diff) < 0.15:
             self.current = self.target
-            self._draw_dynamic(self.current)
+            self._draw_dynamic(self.current, self.target)
             self._anim_job = None
             return
-        factor = 0.22 if diff > 0 else 0.32
-        self.current += diff * factor
-        self._draw_dynamic(self.current)
+        # 快速跟上真实值，不做慢爬
+        self.current += diff * 0.55
+        self._draw_dynamic(self.current, self.target)
         self._anim_job = self.canvas.after(33, self._tick)
 
 
@@ -797,24 +701,27 @@ class SpeedTestApp:
         self.root.resizable(False, False)
 
         self.root.update_idletasks()
-        # 用实际可用屏幕区域居中（排除任务栏）
         sw = self.root.winfo_screenwidth()
         sh = self.root.winfo_screenheight()
         x = max(0, (sw - self.W) // 2)
-        y = max(0, (sh - self.H) // 2 - self.scale(30))  # 略偏上，但不超出屏幕
+        y = max(0, (sh - self.H) // 2 - self.scale(30))
         self.root.geometry(f"{self.W}x{self.H}+{x}+{y}")
 
         self.is_testing = False
-        self.dots_anim = None
+        self._closing = False
+        self.stop_event = threading.Event()
+        self.dots = {"download": None, "upload": None, "realtime": None}
+        self._workers_lock = threading.Lock()
+
         self._build_ui()
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
     def _setup_dpi(self):
         self.dpi_scale = 1.0
         try:
             import ctypes
-            # 让 Windows 感知 DPI（否则 tkinter 会被虚拟化导致模糊）
             try:
-                ctypes.windll.shcore.SetProcessDpiAwareness(2)  # PER_MONITOR_AWARE
+                ctypes.windll.shcore.SetProcessDpiAwareness(2)
             except Exception:
                 try:
                     ctypes.windll.user32.SetProcessDPIAware()
@@ -826,8 +733,6 @@ class SpeedTestApp:
             ctypes.windll.user32.ReleaseDC(0, hdc)
             if dpi > 96:
                 self.dpi_scale = dpi / 96.0
-
-            # 让 tkinter 也按 DPI 缩放
             self.root.tk.call("tk", "scaling", self.dpi_scale * 96 / 72)
         except Exception:
             pass
@@ -860,10 +765,9 @@ class SpeedTestApp:
         self.realtime_var = tk.StringVar(value="")
         ttk.Label(self.root, textvariable=self.realtime_var, font=self._font(9), foreground="blue").pack(pady=self.scale(2))
 
-        self.btn_start = ttk.Button(self.root, text="开始测速", command=self.start_test)
+        self.btn_start = ttk.Button(self.root, text="开始测速", command=self.on_button)
         self.btn_start.pack(pady=self.scale(6))
 
-        # 结果区容器：底层仪表盘，上层结果报告（完成后覆盖）
         self.result_area = tk.Frame(self.root, height=self.scale(340), bg="#0b1020")
         self.result_area.pack(fill="both", expand=True, padx=self.scale(20), pady=(self.scale(2), self.scale(12)))
         self.result_area.pack_propagate(False)
@@ -873,7 +777,6 @@ class SpeedTestApp:
             width=self.scale(520), height=self.scale(340),
         )
 
-        # 结果覆盖层（默认隐藏，测完后盖住仪表盘）
         self.report_frame = tk.Frame(self.result_area, bg=self.root.cget("background"))
         self.report_text = tk.Text(
             self.report_frame, height=15, width=66,
@@ -882,125 +785,208 @@ class SpeedTestApp:
             background=self.root.cget("background"),
         )
         self.report_text.pack(fill="both", expand=True, padx=self.scale(4), pady=self.scale(4))
-        # 启动时只显示仪表盘
         self._show_gauge()
 
     def _show_gauge(self):
-        """显示网速仪表盘，隐藏结果框"""
         self.report_frame.place_forget()
         self.gauge.reset()
 
     def _show_report(self):
-        """结果框覆盖在仪表盘上"""
         self.report_frame.place(relx=0, rely=0, relwidth=1, relheight=1)
         self.report_frame.lift()
+
+    def on_button(self):
+        if self.is_testing:
+            self.stop_test()
+        else:
+            self.start_test()
 
     def start_test(self):
         if self.is_testing:
             return
         self.is_testing = True
-        self.btn_start.config(state="disabled", text="测试中...")
+        self.stop_event.clear()
+        self.btn_start.config(state="normal", text="停止测试")
         self.progress["value"] = 0
-        self.download_var.set("下载速度：等待中")
-        self.upload_var.set("上传速度：等待中")
         self.realtime_var.set("")
         self._set_report("")
-        # 再次测速：重新露出仪表，藏起结果
         self._show_gauge()
+
+        # 现况：下载/上传都进入「等待中...」流转
+        self._start_dots("download", "下载速度：等待中")
+        self._start_dots("upload", "上传速度：等待中")
+
         threading.Thread(target=self._run_test, daemon=True).start()
 
+    def stop_test(self):
+        if not self.is_testing:
+            return
+        self.stop_event.set()
+        self._update_status("正在停止...")
+        self.root.after(0, lambda: self.btn_start.config(state="disabled", text="停止中..."))
+
+    def on_close(self):
+        """右上角关闭：先停测速再销毁窗口，避免线程/动画悬挂"""
+        if self._closing:
+            return
+        self._closing = True
+        self.stop_event.set()
+        self._stop_all_dots()
+        self.gauge.reset()
+        self._update_status("正在退出...")
+        # 给工作线程一点时间收工关连接
+        self.root.after(200, self._destroy_app)
+
+    def _destroy_app(self):
+        try:
+            self._stop_all_dots()
+            self.gauge.reset()
+        except Exception:
+            pass
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
+
     def _gauge_speed(self, mbps, mode):
-        """线程安全地更新仪表盘指针"""
+        if self._closing:
+            return
         self.root.after(0, lambda m=mbps, md=mode: self.gauge.set_speed(m, md))
+
+    def _stopped(self):
+        return self.stop_event.is_set() or self._closing
 
     def _run_test(self):
         results = {}
+        stopped = False
         try:
-            # 1. 探测所有源
             self._update_status("正在探测测速节点")
-            self._start_dots("探测中")
+            self._start_dots("realtime", "探测中")
             self._update_progress(5)
             self._gauge_speed(0, "探测")
 
-            reachable = select_best_source(DOWNLOAD_SOURCES, callback=self._update_realtime)
+            reachable = select_best_source(
+                DOWNLOAD_SOURCES,
+                callback=self._update_realtime,
+                stop_event=self.stop_event,
+            )
+
+            if self._stopped():
+                stopped = True
+                return
 
             if not reachable:
                 self._update_status("所有节点不可达，请检查网络")
-                self._stop_dots()
+                self._stop_dots("realtime")
                 self._gauge_speed(0, "")
                 return
 
-            # 显示节点延迟到实时区域
             node_info = " / ".join(f"{n} {lat:.0f}ms" for n, _, lat in reachable)
             self._update_realtime(f"节点延迟：{node_info}")
             results["nodes"] = node_info
             self._update_progress(15)
-            self._stop_dots()
+            self._stop_dots("realtime")
 
-            # 2. 下载测速——多 URL 多线程持续 10 秒
+            # 下载阶段：下载「测试中...」，上传继续「等待中...」
             self._update_status(f"正在测试下载速度（{DOWNLOAD_DURATION}秒）")
-            self._update("download", "下载速度：测试中")
-            self._start_dots("下载测速中")
+            self._start_dots("download", "下载速度：测试中")
             self._gauge_speed(0, "下载")
 
-            # 用所有可达源（不只最优源），多 URL 并行突破 CDN 单 IP 限速
             all_urls = [url for _, url in DOWNLOAD_SOURCES]
             total_bytes, dl_speed = measure_download_timed(
                 all_urls, duration=DOWNLOAD_DURATION, threads_per_url=8,
                 callback=None,
                 progress_callback=lambda mbps: self._gauge_speed(mbps, "下载"),
+                stop_event=self.stop_event,
             )
 
-            self._stop_dots()
+            if self._stopped():
+                stopped = True
+                if dl_speed > 0:
+                    results["download"] = dl_speed
+                    self._stop_dots("download")
+                    self._set_status_text("download", f"下载速度：{dl_speed:.2f} Mbps")
+                return
+
+            self._stop_dots("download")
             results["download"] = dl_speed
-            self._update("download", f"下载速度：{dl_speed:.2f} Mbps")
+            self._set_status_text("download", f"下载速度：{dl_speed:.2f} Mbps")
             self._gauge_speed(dl_speed, "下载")
             self._update_progress(60)
 
-            # 4. 上传测速——持续 10 秒
+            # 上传阶段：上传「测试中...」
             self._update_status(f"正在测试上传速度（{UPLOAD_DURATION}秒）")
-            self._update("upload", "上传速度：测试中")
-            self._start_dots("上传测速中")
+            self._start_dots("upload", "上传速度：测试中")
             self._gauge_speed(0, "上传")
 
             total_up, ul_speed = measure_upload_timed(
                 UPLOAD_URL, duration=UPLOAD_DURATION, threads=8,
                 callback=None,
                 progress_callback=lambda mbps: self._gauge_speed(mbps, "上传"),
+                stop_event=self.stop_event,
             )
 
-            # 如果 8 线程上传偏低，自动加到 12 线程重试一次
-            if ul_speed < 10:
-                self._stop_dots()
+            # 偏低时加线程重测（可被停止打断）
+            if not self._stopped() and ul_speed < 10:
                 self._update_realtime(f"上传 {ul_speed:.0f} Mbps 偏低，12 线程重试...")
                 self._gauge_speed(0, "上传")
                 total_up, ul_speed = measure_upload_timed(
                     UPLOAD_URL, duration=UPLOAD_DURATION, threads=12,
                     callback=None,
                     progress_callback=lambda mbps: self._gauge_speed(mbps, "上传"),
+                    stop_event=self.stop_event,
                 )
 
-            self._stop_dots()
+            if self._stopped():
+                stopped = True
+                if ul_speed > 0:
+                    results["upload"] = ul_speed
+                    self._stop_dots("upload")
+                    self._set_status_text("upload", f"上传速度：{ul_speed:.2f} Mbps")
+                return
+
+            self._stop_dots("upload")
             results["upload"] = ul_speed
-            self._update("upload", f"上传速度：{ul_speed:.2f} Mbps")
+            self._set_status_text("upload", f"上传速度：{ul_speed:.2f} Mbps")
             self._gauge_speed(ul_speed, "上传")
-            self._update_realtime(f"上传完成: {total_up/1_000_000:.1f}MB / {UPLOAD_DURATION}s = {ul_speed:.2f} Mbps")
+            self._update_realtime(
+                f"上传完成: {total_up/1_000_000:.1f}MB / {UPLOAD_DURATION}s = {ul_speed:.2f} Mbps"
+            )
             self._update_progress(95)
 
-            # 5. 完成——结果框覆盖仪表盘
             self._update_progress(100)
             self._update_status("测速完成！")
             report = self._generate_report(results)
             self._set_report(report)
-            self.root.after(0, self._show_report)
+            if not self._closing:
+                self.root.after(0, self._show_report)
 
         except Exception as e:
             self._update_status(f"测速失败：{e}")
-            self._stop_dots()
             self._gauge_speed(0, "")
         finally:
+            self._stop_all_dots()
+            # 若停止时现况还停在「等待中/测试中」动画文案，收成静默状态
+            if stopped:
+                self._finalize_stopped_status(results)
+                self._update_status("测试已停止")
             self.is_testing = False
-            self.root.after(0, lambda: self.btn_start.config(state="normal", text="开始测速"))
+            if not self._closing:
+                self.root.after(0, lambda: self.btn_start.config(state="normal", text="开始测速"))
+
+    def _finalize_stopped_status(self, results):
+        if "download" in results:
+            self._set_status_text("download", f"下载速度：{results['download']:.2f} Mbps")
+        else:
+            cur = self.download_var.get()
+            if "等待中" in cur or "测试中" in cur:
+                self._set_status_text("download", "下载速度：—")
+        if "upload" in results:
+            self._set_status_text("upload", f"上传速度：{results['upload']:.2f} Mbps")
+        else:
+            cur = self.upload_var.get()
+            if "等待中" in cur or "测试中" in cur:
+                self._set_status_text("upload", "上传速度：—")
 
     def _generate_report(self, r):
         now = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -1036,33 +1022,55 @@ class SpeedTestApp:
 ╚══════════════════════════════════════╝"""
 
     def _update_status(self, text):
+        if self._closing:
+            return
         self.root.after(0, lambda: self.status_var.set(text))
 
     def _update_progress(self, value):
+        if self._closing:
+            return
         self.root.after(0, lambda: self.progress.config(value=value))
 
-    def _update(self, key, text):
-        m = {"download": self.download_var, "upload": self.upload_var}
-        if key in m:
-            self.root.after(0, lambda: m[key].set(text))
+    def _set_status_text(self, key, text):
+        """设置现况文案（会先停掉对应省略号动画）"""
+        self._stop_dots(key)
+        var = {"download": self.download_var, "upload": self.upload_var}.get(key)
+        if var is not None and not self._closing:
+            self.root.after(0, lambda: var.set(text))
 
     def _update_realtime(self, text):
-        if self.dots_anim:
-            self.dots_anim.stop()
-            self.dots_anim = None
-        self.root.after(0, lambda: self.realtime_var.set(text))
+        self._stop_dots("realtime")
+        if not self._closing:
+            self.root.after(0, lambda: self.realtime_var.set(text))
 
-    def _start_dots(self, base_text):
-        self._stop_dots()
-        self.dots_anim = DotAnimator(self.realtime_var, base_text, self.root)
-        self.dots_anim.start()
+    def _start_dots(self, key, base_text):
+        self._stop_dots(key)
+        var_map = {
+            "download": self.download_var,
+            "upload": self.upload_var,
+            "realtime": self.realtime_var,
+        }
+        var = var_map.get(key)
+        if var is None or self._closing:
+            return
+        anim = DotAnimator(var, base_text, self.root)
+        self.dots[key] = anim
+        anim.start()
 
-    def _stop_dots(self):
-        if self.dots_anim:
-            self.dots_anim.stop()
-            self.dots_anim = None
+    def _stop_dots(self, key):
+        anim = self.dots.get(key)
+        if anim:
+            anim.stop()
+            self.dots[key] = None
+
+    def _stop_all_dots(self):
+        for key in list(self.dots.keys()):
+            self._stop_dots(key)
 
     def _set_report(self, text):
+        if self._closing:
+            return
+
         def _do():
             self.report_text.config(state="normal")
             self.report_text.delete("1.0", "end")
@@ -1088,7 +1096,7 @@ def main():
             root.iconbitmap(icon)
         except Exception:
             pass
-    app = SpeedTestApp(root)
+    SpeedTestApp(root)
     root.mainloop()
 
 
