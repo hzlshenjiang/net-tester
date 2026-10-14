@@ -2,7 +2,7 @@
 """网络测速工具 - 绿色版
 
 测速方案（参考 speedtest-cli / cfspeed 思路，针对国内优化）：
-1. 探测选源：小文件下载测延迟，选最快的 CDN
+1. 地区源池 + 启动并行 TCP 探测，会话复用，动态择优 2～4 源
 2. 下载测速：多线程持续下载 10 秒，取总吞吐量
 3. 上传测速：http.client 多连接连续 POST 大包（类 cfspeed），取吞吐量
 4. 延迟：TCP 连接测延迟
@@ -22,7 +22,18 @@ import math
 import http.client
 import urllib.request
 from urllib.parse import urlparse
-from queue import Queue
+from queue import Empty, Queue
+
+from source_selection import (
+    DEFAULT_REGION,
+    REGION_LABELS,
+    ProbeSession,
+    RegionCatalog,
+    load_settings,
+    locate_region_by_ip,
+    resolve_region,
+    save_settings,
+)
 
 
 # ─── 测速核心 ───
@@ -35,12 +46,8 @@ _ctx.verify_mode = ssl.CERT_NONE
 _orig = socket.getaddrinfo
 socket.getaddrinfo = lambda *a, **k: [r for r in _orig(*a, **k) if r[0] == socket.AF_INET]
 
-# 下载测速源
-DOWNLOAD_SOURCES = [
-    ("华为云镜像", "https://mirrors.huaweicloud.com/nodejs/v20.17.0/node-v20.17.0-x64.msi"),
-    ("华为云-Python", "https://mirrors.huaweicloud.com/python/3.12.5/Python-3.12.5.tgz"),
-    ("腾讯-微信", "https://dldir1.qq.com/weixin/Windows/WeChatSetup.exe"),
-]
+# 兼容旧引用：默认华南源池
+DOWNLOAD_SOURCES = RegionCatalog.sources_for(DEFAULT_REGION)
 
 # 上传端点（Cloudflare 公开测速，与 cfspeed / speed.cloudflare.com 相同）
 UPLOAD_URL = "https://speed.cloudflare.com/__up"
@@ -48,8 +55,6 @@ UPLOAD_URL = "https://speed.cloudflare.com/__up"
 # 测速持续时间（秒）
 DOWNLOAD_DURATION = 10
 UPLOAD_DURATION = 10
-# 探测超时（秒）
-PROBE_TIMEOUT = 3
 
 
 class ByteAccumulator:
@@ -120,55 +125,6 @@ def measure_ping(host, port=443, count=5, timeout=5):
     if not latencies:
         return 0
     return sum(latencies) / len(latencies)
-
-
-def probe_source(name, url, timeout=PROBE_TIMEOUT):
-    """探测一个源：TCP 连接测延迟 + 下载 1MB 确认可达
-
-    返回 (name, 下载字节数, TCP延迟ms)
-    """
-    try:
-        parsed = urlparse(url)
-        host = parsed.hostname
-        port = parsed.port or (443 if parsed.scheme == "https" else 80)
-
-        tcp_latencies = []
-        for _ in range(3):
-            try:
-                start = time.time()
-                sock = socket.create_connection((host, port), timeout=timeout)
-                lat = (time.time() - start) * 1000
-                sock.close()
-                tcp_latencies.append(lat)
-            except Exception:
-                pass
-        latency_ms = sum(tcp_latencies) / len(tcp_latencies) if tcp_latencies else 99999
-
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0", "Range": "bytes=0-1048575"})
-        with urllib.request.urlopen(req, timeout=timeout, context=_ctx) as resp:
-            data = resp.read(1048576)
-        return name, len(data), latency_ms
-    except Exception:
-        return name, 0, 99999
-
-
-def select_best_source(sources, callback=None, stop_event=None):
-    """探测所有源，返回所有可达源 [(name, url, latency_ms), ...]"""
-    results = []
-    for name, url in sources:
-        if stop_event is not None and stop_event.is_set():
-            break
-        if callback:
-            callback(f"探测 {name}...")
-        _, size, latency_ms = probe_source(name, url)
-        if size > 0:
-            results.append((name, url, latency_ms))
-            if callback:
-                callback(f"{name}: 延迟 {latency_ms:.0f}ms")
-        else:
-            if callback:
-                callback(f"{name}: 不可达")
-    return results
 
 
 class TimedDownloader(threading.Thread):
@@ -707,7 +663,7 @@ class SpeedTestApp:
 
         self._setup_dpi()
         self.W = self.scale(580)
-        self.H = self.scale(760)
+        self.H = self.scale(820)
         self.root.geometry(f"{self.W}x{self.H}")
         self.root.resizable(False, False)
 
@@ -724,8 +680,18 @@ class SpeedTestApp:
         self.dots = {"download": None, "upload": None, "realtime": None}
         self._workers_lock = threading.Lock()
 
+        self.settings = load_settings()
+        self.probe_session = ProbeSession()
+        self._probe_lock = threading.Lock()
+        self._probing = False
+        self._ui_queue = Queue()
+
         self._build_ui()
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+        # 主线程消费 UI 队列（后台线程禁止直接 after）
+        self.root.after(50, self._poll_ui)
+        # 启动后台预热探测（会话复用）
+        self.root.after(100, self._start_background_probe)
 
     def _setup_dpi(self):
         self.dpi_scale = 1.0
@@ -755,17 +721,52 @@ class SpeedTestApp:
         return ("Microsoft YaHei", self.scale(size), weight)
 
     def _build_ui(self):
-        ttk.Label(self.root, text="网络测速工具", font=self._font(18, "bold")).pack(pady=(self.scale(16), self.scale(4)))
-        ttk.Label(self.root, text="智能选源 · 定时测速 · 多线程", font=self._font(10), foreground="gray").pack(pady=(0, self.scale(6)))
+        ttk.Label(self.root, text="网络测速工具", font=self._font(18, "bold")).pack(pady=(self.scale(12), self.scale(2)))
+        ttk.Label(self.root, text="地区择优 · 定时测速 · 多线程", font=self._font(10), foreground="gray").pack(pady=(0, self.scale(4)))
 
-        self.status_var = tk.StringVar(value="就绪 — 点击开始测速")
+        self.status_var = tk.StringVar(value="正在准备测速节点…")
         ttk.Label(self.root, textvariable=self.status_var, font=self._font(11)).pack(pady=self.scale(2))
 
         self.progress = ttk.Progressbar(self.root, orient="horizontal", length=self.scale(460), mode="determinate")
-        self.progress.pack(pady=self.scale(6))
+        self.progress.pack(pady=self.scale(4))
 
-        frame = ttk.LabelFrame(self.root, text="测试现况", padding=self.scale(10))
-        frame.pack(fill="x", padx=self.scale(30), pady=self.scale(4))
+        # 地区选择（只能改地区；具体源由软件自动择优）
+        src_frame = ttk.LabelFrame(self.root, text="测速地区", padding=self.scale(8))
+        src_frame.pack(fill="x", padx=self.scale(30), pady=self.scale(2))
+
+        row = ttk.Frame(src_frame)
+        row.pack(fill="x")
+        ttk.Label(row, text="地区", font=self._font(10)).pack(side="left", padx=(0, self.scale(6)))
+
+        self._region_ids = RegionCatalog.region_ids()
+        self._region_labels = [REGION_LABELS.get(r, r) for r in self._region_ids]
+        cur = self.settings.get("region") or DEFAULT_REGION
+        if cur not in self._region_ids:
+            cur = DEFAULT_REGION
+        self.region_var = tk.StringVar(value=REGION_LABELS.get(cur, "华南"))
+        self.region_combo = ttk.Combobox(
+            row, textvariable=self.region_var, values=self._region_labels,
+            state="readonly", width=10, font=self._font(10),
+        )
+        self.region_combo.pack(side="left")
+        self.region_combo.bind("<<ComboboxSelected>>", self._on_region_changed)
+
+        self.auto_locate_var = tk.BooleanVar(value=bool(self.settings.get("auto_locate", False)))
+        ttk.Checkbutton(
+            row, text="自动定位", variable=self.auto_locate_var,
+            command=self._on_auto_locate_toggled,
+        ).pack(side="left", padx=(self.scale(12), 0))
+
+        self.btn_reprobe = ttk.Button(row, text="重新探测", command=self._on_reprobe_clicked)
+        self.btn_reprobe.pack(side="right")
+
+        self.sources_var = tk.StringVar(value="测速源：探测中…")
+        ttk.Label(src_frame, textvariable=self.sources_var, font=self._font(9), foreground="gray").pack(
+            anchor="w", pady=(self.scale(4), 0),
+        )
+
+        frame = ttk.LabelFrame(self.root, text="测试现况", padding=self.scale(8))
+        frame.pack(fill="x", padx=self.scale(30), pady=self.scale(2))
 
         self.download_var = tk.StringVar(value="下载速度：—")
         ttk.Label(frame, textvariable=self.download_var, font=self._font(12)).pack(anchor="w", pady=self.scale(1))
@@ -777,7 +778,7 @@ class SpeedTestApp:
         ttk.Label(self.root, textvariable=self.realtime_var, font=self._font(9), foreground="blue").pack(pady=self.scale(2))
 
         self.btn_start = ttk.Button(self.root, text="开始测速", command=self.on_button)
-        self.btn_start.pack(pady=self.scale(6))
+        self.btn_start.pack(pady=self.scale(4))
 
         self.result_area = tk.Frame(self.root, height=self.scale(340), bg="#0b1020")
         self.result_area.pack(fill="both", expand=True, padx=self.scale(20), pady=(self.scale(2), self.scale(12)))
@@ -822,6 +823,8 @@ class SpeedTestApp:
         self.realtime_var.set("")
         self._set_report("")
         self._show_gauge()
+        # 主线程快照地区，供后台测速线程使用（勿在子线程读 Tk 变量）
+        self._test_region_id = self._current_region_id()
 
         # 现况：下载/上传都进入「等待中...」流转
         self._start_dots("download", "下载速度：等待中")
@@ -891,45 +894,159 @@ class SpeedTestApp:
     def _stopped(self):
         return self.stop_event.is_set() or self._closing
 
+    def _label_to_region_id(self, label: str) -> str:
+        for rid, lab in REGION_LABELS.items():
+            if lab == label:
+                return rid
+        return DEFAULT_REGION
+
+    def _current_region_id(self) -> str:
+        return self._label_to_region_id(self.region_var.get())
+
+    def _persist_settings(self):
+        self.settings["region"] = self._current_region_id()
+        self.settings["auto_locate"] = bool(self.auto_locate_var.get())
+        save_settings(self.settings)
+
+    def _start_background_probe(self):
+        """启动或换区后的后台探测。"""
+        if self._closing:
+            return
+        region = self._current_region_id()
+        auto = bool(self.auto_locate_var.get())
+        threading.Thread(
+            target=self._probe_worker, args=(False, region, auto), daemon=True,
+        ).start()
+
+    def _on_reprobe_clicked(self):
+        if self.is_testing or self._probing:
+            return
+        self.probe_session.invalidate()
+        self.sources_var.set("测速源：重新探测中…")
+        self.status_var.set("正在重新探测节点…")
+        region = self._current_region_id()
+        auto = bool(self.auto_locate_var.get())
+        threading.Thread(
+            target=self._probe_worker, args=(True, region, auto), daemon=True,
+        ).start()
+
+    def _on_region_changed(self, _event=None):
+        if self.auto_locate_var.get():
+            # 手改地区时关闭自动定位，避免下次又被覆盖
+            self.auto_locate_var.set(False)
+        self._persist_settings()
+        self.probe_session.invalidate()
+        self.sources_var.set("测速源：探测中…")
+        self.status_var.set("地区已切换，正在探测…")
+        region = self._current_region_id()
+        auto = bool(self.auto_locate_var.get())
+        threading.Thread(
+            target=self._probe_worker, args=(True, region, auto), daemon=True,
+        ).start()
+
+    def _on_auto_locate_toggled(self):
+        self._persist_settings()
+        if not self.auto_locate_var.get():
+            return
+        self.status_var.set("正在自动定位…")
+        self.sources_var.set("测速源：定位中…")
+
+        def _job():
+            region = resolve_region(self.settings, locate_fn=locate_region_by_ip)
+            label = REGION_LABELS.get(region, "华南")
+
+            def _apply():
+                if self._closing:
+                    return
+                self.region_var.set(label)
+                self.settings["region"] = region
+                save_settings(self.settings)
+                self.probe_session.invalidate()
+                self._start_background_probe()
+
+            self._ui(_apply)
+
+        threading.Thread(target=_job, daemon=True).start()
+
+    def _probe_worker(self, force: bool, region_id: str, auto_locate: bool):
+        with self._probe_lock:
+            if self._probing and not force:
+                return
+            self._probing = True
+        try:
+            region = resolve_region(
+                {"region": region_id, "auto_locate": auto_locate},
+                locate_fn=locate_region_by_ip if auto_locate else None,
+            )
+            # 若定位改了地区，同步下拉框
+            label = REGION_LABELS.get(region, "华南")
+            self._ui(lambda: self.region_var.set(label))
+
+            selected = self.probe_session.ensure_probed(region)
+            summary = self.probe_session.summary_text()
+
+            def _done():
+                if self._closing:
+                    return
+                if selected:
+                    self.sources_var.set(f"测速源：{summary}")
+                    if not self.is_testing:
+                        self.status_var.set("就绪 — 点击开始测速")
+                else:
+                    self.sources_var.set("测速源：无可用节点")
+                    if not self.is_testing:
+                        self.status_var.set("节点不可达，请检查网络或换地区")
+
+            self._ui(_done)
+        finally:
+            with self._probe_lock:
+                self._probing = False
+
+    def _wait_probe_ready(self, timeout: float = 8.0) -> bool:
+        """开测前确保会话已探测；必要时同步补探。"""
+        if self.probe_session.ready and self.probe_session.selected_urls():
+            # 地区一致才复用
+            if self.probe_session.region == getattr(self, "_test_region_id", None):
+                return True
+        region = getattr(self, "_test_region_id", None) or DEFAULT_REGION
+        self.probe_session.ensure_probed(region, stop_event=self.stop_event)
+        return bool(self.probe_session.selected_urls())
+
     def _run_test(self):
         results = {}
         stopped = False
         try:
-            self._update_status("正在探测测速节点")
-            self._start_dots("realtime", "探测中")
+            self._update_status("正在确认测速节点")
             self._update_progress(5)
             self._gauge_speed(0, "探测")
 
-            reachable = select_best_source(
-                DOWNLOAD_SOURCES,
-                callback=self._update_realtime,
-                stop_event=self.stop_event,
-            )
+            if not self._wait_probe_ready():
+                if self._stopped():
+                    stopped = True
+                    return
+                self._update_status("所有节点不可达，请检查网络")
+                self._gauge_speed(0, "")
+                return
 
             if self._stopped():
                 stopped = True
                 return
 
-            if not reachable:
-                self._update_status("所有节点不可达，请检查网络")
-                self._stop_dots("realtime")
-                self._gauge_speed(0, "")
-                return
-
-            node_info = " / ".join(f"{n} {lat:.0f}ms" for n, _, lat in reachable)
+            selected = self.probe_session.selected_results()
+            node_info = self.probe_session.summary_text()
             self._update_realtime(f"节点延迟：{node_info}")
+            self._ui(lambda: self.sources_var.set(f"测速源：{node_info}"))
             results["nodes"] = node_info
             self._update_progress(15)
-            self._stop_dots("realtime")
 
-            # 下载阶段：下载「测试中...」，上传继续「等待中...」
+            # 下载阶段：只用择优源
             self._update_status(f"正在测试下载速度（{DOWNLOAD_DURATION}秒）")
             self._start_dots("download", "下载速度：测试中")
             self._gauge_speed(0, "下载")
 
-            all_urls = [url for _, url in DOWNLOAD_SOURCES]
+            urls = [u for _, u, _ in selected]
             total_bytes, dl_speed = measure_download_timed(
-                all_urls, duration=DOWNLOAD_DURATION, threads_per_url=8,
+                urls, duration=DOWNLOAD_DURATION, threads_per_url=8,
                 callback=None,
                 progress_callback=lambda mbps: self._gauge_speed(mbps, "下载"),
                 stop_event=self.stop_event,
@@ -1058,11 +1175,28 @@ class SpeedTestApp:
 ╚══════════════════════════════════════╝"""
 
     def _ui(self, fn):
-        """投递到主线程；窗口关闭中则忽略，避免后台线程炸异常"""
+        """投递到主线程队列；由 _poll_ui 执行（线程安全）"""
         if self._closing:
             return
         try:
-            self.root.after(0, fn)
+            self._ui_queue.put(fn)
+        except Exception:
+            pass
+
+    def _poll_ui(self):
+        if self._closing:
+            return
+        try:
+            while True:
+                fn = self._ui_queue.get_nowait()
+                try:
+                    fn()
+                except Exception:
+                    pass
+        except Empty:
+            pass
+        try:
+            self.root.after(50, self._poll_ui)
         except Exception:
             pass
 
