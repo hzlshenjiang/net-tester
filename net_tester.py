@@ -51,25 +51,29 @@ PROBE_TIMEOUT = 3
 
 
 class ByteAccumulator:
-    """线程安全的字节累计器，供仪表盘读取稳定速度"""
+    """线程安全的字节累计器，供仪表盘读取近窗口速度"""
 
-    # 开测后预热，避免极短时间内字节/时间被放大成虚高
-    WARMUP_SEC = 0.8
-    # 瞬时窗口加长，并强制最短分母，抑制突发尖峰
-    WINDOW_SEC = 2.0
-    MIN_WINDOW_SEC = 0.6
+    # 近窗口：反映“此刻吞吐”，不会像总均速那样从 0 慢慢爬
+    WINDOW_SEC = 1.2
+    MIN_WINDOW_SEC = 0.35
+    # 下载开局极短窗口容易虚高，要求至少攒到这么久才报窗口速度
+    DOWNLOAD_MIN_ELAPSED = 0.5
 
     def __init__(self):
         self._lock = threading.Lock()
         self.total = 0
         self._window = []  # (timestamp, bytes)
-        self._t0 = None
+        self._t0 = None            # reset 时刻（含建连空窗）
+        self._first_byte_t = None  # 真正开始传数据的时刻
+        self._last_byte_t = None   # 最后一次记账时刻
 
     def reset(self):
         with self._lock:
             self.total = 0
             self._window = []
             self._t0 = time.time()
+            self._first_byte_t = None
+            self._last_byte_t = None
 
     def add(self, n):
         if n <= 0:
@@ -78,6 +82,9 @@ class ByteAccumulator:
         with self._lock:
             if self._t0 is None:
                 self._t0 = now
+            if self._first_byte_t is None:
+                self._first_byte_t = now
+            self._last_byte_t = now
             self.total += n
             self._window.append((now, n))
             cutoff = now - self.WINDOW_SEC
@@ -89,42 +96,57 @@ class ByteAccumulator:
                 return 0.0
             return max(time.time() - self._t0, 0.0)
 
+    def transfer_elapsed(self):
+        """首字节→末字节的传输时长（排除建连空窗与收尾等待）"""
+        with self._lock:
+            if self._first_byte_t is None or self._last_byte_t is None:
+                return 0.0
+            return max(self._last_byte_t - self._first_byte_t, 0.0)
+
     def average_mbps(self):
-        """从开始到现在的平均速度（Mbps）"""
+        """从首字节到现在的平均速度（Mbps），不含建连等待"""
         now = time.time()
         with self._lock:
-            if self._t0 is None or self.total <= 0:
+            if self._first_byte_t is None or self.total <= 0:
                 return 0.0
-            elapsed = max(now - self._t0, 0.001)
+            elapsed = max(now - self._first_byte_t, 0.001)
             return self.total / elapsed * 8 / 1_000_000
 
-    def display_mbps(self, prefer_average=False):
-        """仪表盘用速度：预热后以均速为主，避免指针虚高/在 0~峰值间抽动"""
+    def window_mbps(self):
+        """近 1.2 秒窗口吞吐（Mbps）——仪表盘主数据源"""
         now = time.time()
         with self._lock:
-            if self._t0 is None or self.total <= 0:
+            if not self._window:
                 return 0.0
-            elapsed = now - self._t0
-            if elapsed < self.WARMUP_SEC:
-                return 0.0
-
-            avg = self.total / elapsed * 8 / 1_000_000
-
             cutoff = now - self.WINDOW_SEC
             recent = [(t, b) for t, b in self._window if t >= cutoff]
-            if len(recent) < 2:
-                return avg
-
+            if not recent:
+                return 0.0
             w_elapsed = max(now - recent[0][0], self.MIN_WINDOW_SEC)
-            instant = sum(b for _, b in recent) / w_elapsed * 8 / 1_000_000
+            return sum(b for _, b in recent) / w_elapsed * 8 / 1_000_000
 
-            # 上传包间隔明显：几乎只看均速，指针才会贴着峰值走
-            if prefer_average:
-                return avg * 0.9 + instant * 0.1
-            # 下载前几秒仍偏均速，稳住后再略加瞬时跟手感
-            if elapsed < 2.5:
-                return avg * 0.88 + instant * 0.12
-            return avg * 0.6 + instant * 0.4
+    def display_mbps(self, prefer_average=False):
+        """仪表盘速度：默认近窗口；下载开局略加均速抑制虚高"""
+        win = self.window_mbps()
+        avg = self.average_mbps()
+        te = self.transfer_elapsed()
+
+        if prefer_average:
+            # 上传：近窗口为主；均速在极短时长会虚高，前 0.8s 只用窗口
+            if win <= 0:
+                return 0.0
+            if te < 0.8:
+                return win
+            return win * 0.85 + avg * 0.15
+
+        # 下载：还没传够半秒先报 0，避免指针虚冲
+        if te < self.DOWNLOAD_MIN_ELAPSED:
+            return 0.0
+        if win <= 0:
+            return avg
+        if te < 2.0:
+            return win * 0.45 + avg * 0.55
+        return win * 0.7 + avg * 0.3
 
 
 def measure_ping(host, port=443, count=5, timeout=5):
@@ -260,7 +282,7 @@ def measure_download_timed(urls, duration=DOWNLOAD_DURATION, threads_per_url=8,
     if callback:
         callback(f"下载中: {len(urls)}个源 × {threads_per_url}线程 = {total_threads}连接")
 
-    # 轮询稳定速度，直到线程结束；EMA 再压一层尖峰
+    # 近窗口速度 + 轻度 EMA；下载开局由 display_mbps 自己抑制虚高
     deadline = time.time() + duration + 10
     ema = 0.0
     ema_ready = False
@@ -274,7 +296,7 @@ def measure_download_timed(urls, duration=DOWNLOAD_DURATION, threads_per_url=8,
                     ema = raw
                     ema_ready = True
                 else:
-                    ema = ema * 0.8 + raw * 0.2
+                    ema = ema * 0.55 + raw * 0.45
                 progress_callback(ema)
         time.sleep(0.1)
 
@@ -296,15 +318,19 @@ def measure_download_timed(urls, duration=DOWNLOAD_DURATION, threads_per_url=8,
 
 
 class UploadStream:
-    """可被 urllib 边读边发的上传体：按块记账，避免整包完成才跳变"""
+    """可被 urllib 边读边发的上传体：按块记账，到点停止（避免大包拖死时长）"""
 
-    def __init__(self, total_size, chunk_size, accumulator):
+    def __init__(self, total_size, chunk_size, accumulator, end_time=None):
         self.total_size = total_size
         self.sent = 0
         self.chunk = b"0" * chunk_size
         self.accumulator = accumulator
+        self.end_time = end_time
 
     def read(self, size=-1):
+        # 到点立即停，宁可连接报错，也不让单请求拖到十几秒
+        if self.end_time is not None and time.time() >= self.end_time:
+            return b""
         if self.sent >= self.total_size:
             return b""
         if size is None or size < 0:
@@ -319,10 +345,10 @@ class UploadStream:
 
 
 class TimedUploader(threading.Thread):
-    """按时间上传——大包 POST，发送过程中按块累计字节"""
+    """按时间上传——1MB 流式 POST，边发边记账，到点截断"""
 
-    # 单次 POST 4MB，减少请求间隙；读块 64KB，仪表盘可平滑上涨
-    PAYLOAD_SIZE = 4 * 1024 * 1024
+    # 实测：4MB 包在中低上行会拖过测试时长且出字节更晚；1MB 更稳
+    PAYLOAD_SIZE = 1 * 1024 * 1024
     READ_CHUNK = 64 * 1024
 
     def __init__(self, url, duration, result_queue, thread_id, accumulator=None):
@@ -340,9 +366,17 @@ class TimedUploader(threading.Thread):
     def run(self):
         total_bytes = 0
         start = time.time()
+        end_time = start + self.duration
         try:
-            while not self._should_stop and (time.time() - start) < self.duration:
-                body = UploadStream(self.PAYLOAD_SIZE, self.READ_CHUNK, self.accumulator)
+            while not self._should_stop and time.time() < end_time:
+                remain = end_time - time.time()
+                # 剩余不够发完一整包就停：中途截断会和 Content-Length 打架导致空等超时
+                if remain < 2.0:
+                    break
+                body = UploadStream(
+                    self.PAYLOAD_SIZE, self.READ_CHUNK,
+                    self.accumulator, end_time=None,
+                )
                 req = urllib.request.Request(
                     self.url, data=body,
                     headers={
@@ -353,14 +387,13 @@ class TimedUploader(threading.Thread):
                     method="POST",
                 )
                 try:
-                    with urllib.request.urlopen(req, timeout=30, context=_ctx) as resp:
+                    with urllib.request.urlopen(req, timeout=15, context=_ctx) as resp:
                         resp.read()
                     total_bytes += body.sent
                 except Exception:
-                    # 超时/中断时仍计入已发出的字节
                     total_bytes += body.sent
-                    if time.time() - start >= self.duration:
-                        break
+                if time.time() >= end_time or self._should_stop:
+                    break
         except Exception:
             pass
         elapsed = time.time() - start
@@ -374,31 +407,52 @@ def measure_upload_timed(url, duration=UPLOAD_DURATION, threads=8,
     acc.reset()
     q = Queue()
     workers = []
+    t_start = time.time()
+    t_end = t_start + duration
     for i in range(threads):
         t = TimedUploader(url, duration, q, i, accumulator=acc)
         workers.append(t)
         t.start()
 
-    deadline = time.time() + duration + 10
     ema = 0.0
     ema_ready = False
-    while any(t.is_alive() for t in workers) and time.time() < deadline:
+    last_good = 0.0
+    last_good_t = 0.0
+    # 进度只跟到正式时长；之后保峰值，不再因窗口清空掉到 0
+    while time.time() < t_end:
         if progress_callback:
-            # 上传以均速为主，请求间隙不会掉回 0
             raw = acc.display_mbps(prefer_average=True)
-            if raw <= 0 and not ema_ready:
+            now = time.time()
+            # 请求间隙窗口可能短暂为 0：短时保持上次好值，避免指针掉零
+            if raw > 0.5:
+                last_good = raw
+                last_good_t = now
+                sample = raw
+            elif last_good_t and (now - last_good_t) < 0.7:
+                sample = last_good
+            else:
+                sample = 0.0
+
+            if sample <= 0 and not ema_ready:
                 progress_callback(0.0)
             else:
                 if not ema_ready:
-                    ema = raw
+                    ema = sample
                     ema_ready = True
                 else:
-                    ema = ema * 0.85 + raw * 0.15
+                    # 跟上峰值要快，不能那种“从 0 慢慢爬”
+                    ema = ema * 0.5 + sample * 0.5
                 progress_callback(ema)
         time.sleep(0.1)
 
+    # 到点：钉住最后读数，并通知线程收工
+    if progress_callback and ema_ready:
+        progress_callback(ema)
     for t in workers:
-        t.join(timeout=2)
+        t.stop()
+    join_deadline = time.time() + 3
+    for t in workers:
+        t.join(timeout=max(join_deadline - time.time(), 0.05))
 
     total_bytes = 0
     max_elapsed = 0
@@ -407,10 +461,15 @@ def measure_upload_timed(url, duration=UPLOAD_DURATION, threads=8,
         total_bytes += bytes_up
         max_elapsed = max(max_elapsed, elapsed)
 
-    if max_elapsed < 0.5:
+    # 最终成绩按首字节→末字节，排除建连空窗
+    transfer_secs = acc.transfer_elapsed()
+    if transfer_secs >= 0.5 and total_bytes > 0:
+        speed_mbps = total_bytes / transfer_secs * 8 / 1_000_000
+    elif max_elapsed >= 0.5 and total_bytes > 0:
+        speed_mbps = total_bytes / max_elapsed * 8 / 1_000_000
+    else:
         return 0, 0
 
-    speed_mbps = total_bytes / max_elapsed * 8 / 1_000_000
     return total_bytes, speed_mbps
 
 
