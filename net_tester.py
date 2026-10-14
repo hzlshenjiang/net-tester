@@ -250,31 +250,32 @@ def measure_download_timed(urls, duration=DOWNLOAD_DURATION, threads_per_url=8,
     for t in workers:
         t.join(timeout=max(join_deadline - time.time(), 0.05))
 
-    total_bytes = 0
-    max_elapsed = 0
-    while not q.empty():
-        _, bytes_down, elapsed = q.get()
-        total_bytes += bytes_down
-        max_elapsed = max(max_elapsed, elapsed)
-
+    total_bytes = acc.total
     transfer_secs = acc.transfer_elapsed()
     if transfer_secs >= 0.5 and total_bytes > 0:
         return total_bytes, total_bytes / transfer_secs * 8 / 1_000_000
-    if max_elapsed >= 0.5 and total_bytes > 0:
-        return total_bytes, total_bytes / max_elapsed * 8 / 1_000_000
+
+    max_elapsed = 0
+    queued = 0
+    while not q.empty():
+        _, bytes_down, elapsed = q.get()
+        queued += bytes_down
+        max_elapsed = max(max_elapsed, elapsed)
+    if max_elapsed >= 0.5 and queued > 0:
+        return queued, queued / max_elapsed * 8 / 1_000_000
     return 0, 0
 
 
 class ContinuousUploader(threading.Thread):
-    """单连接连续上传大包（参考 cfspeed：并行流 + 大 payload）
+    """并行连续上传（对齐 cfspeed：每流约 10MB，循环 POST，http.client 边发边记账）
 
-    用 http.client 直接 send，避免 urllib 反复建短请求造成吞吐起伏。
-    Content-Length 按整段测速时长预留，到点关连接，字节按实际 send 累计。
+    不用“整段测速预留数 GB Content-Length”——实测会导致首字节极慢。
+    到点或停止时关连接；字节按实际 send 累计，仪表用真实累计吞吐。
     """
 
-    CHUNK = 256 * 1024  # 256KB
-    # 预留上限：按 2Gbps × 时长，保证单次 POST 覆盖整段测试
-    MAX_BPS = 2_000_000_000
+    CHUNK = 256 * 1024          # 256KB
+    # 20MB：比 cfspeed 默认 10MB 更长连发，减少请求间隙；又远小于“数 GB 预留”那种首字节迟滞
+    PAYLOAD_SIZE = 20 * 1024 * 1024
 
     def __init__(self, url, duration, result_queue, thread_id, accumulator=None, stop_event=None):
         super().__init__(daemon=True)
@@ -311,36 +312,43 @@ class ContinuousUploader(threading.Thread):
         start = time.time()
         end_time = start + self.duration
         chunk = b"0" * self.CHUNK
-        payload_cap = max(int(self.MAX_BPS / 8 * self.duration), self.CHUNK * 16)
 
         try:
             while not self._stopped() and time.time() < end_time:
+                remain_time = end_time - time.time()
+                # 剩余太短不再开新 10MB 请求
+                if remain_time < 1.0:
+                    break
                 conn = None
                 try:
-                    if self._stopped() or time.time() >= end_time:
-                        break
-                    # 超时随剩余时长收缩，便于停止时尽快返回
-                    remain_time = max(end_time - time.time(), 1.0)
                     conn = http.client.HTTPSConnection(
-                        host, port, context=_ctx, timeout=min(12.0, remain_time + 3.0),
+                        host, port, context=_ctx, timeout=min(20.0, remain_time + 5.0),
                     )
                     self._conn = conn
-                    remain = payload_cap
+                    size = self.PAYLOAD_SIZE
                     conn.putrequest("POST", path)
                     conn.putheader("User-Agent", "Mozilla/5.0")
                     conn.putheader("Content-Type", "application/octet-stream")
-                    conn.putheader("Content-Length", str(remain))
+                    conn.putheader("Content-Length", str(size))
                     conn.endheaders()
 
-                    while not self._stopped() and time.time() < end_time and remain > 0:
-                        n = min(len(chunk), remain)
+                    sent = 0
+                    while not self._stopped() and time.time() < end_time and sent < size:
+                        n = min(len(chunk), size - sent)
                         conn.send(chunk[:n])
-                        remain -= n
+                        sent += n
                         total_bytes += n
                         if self.accumulator:
                             self.accumulator.add(n)
+
+                    # 正常发完则读掉响应，便于连接干净结束
+                    if sent >= size and not self._stopped() and time.time() < end_time:
+                        try:
+                            resp = conn.getresponse()
+                            resp.read()
+                        except Exception:
+                            pass
                 except Exception:
-                    # 连接被掐断则重连继续，直到时长结束——真实网络重试
                     if self._stopped() or time.time() >= end_time:
                         break
                     time.sleep(0.05)
@@ -388,18 +396,21 @@ def measure_upload_timed(url, duration=UPLOAD_DURATION, threads=8,
     for t in workers:
         t.join(timeout=max(join_deadline - time.time(), 0.05))
 
-    total_bytes = 0
-    max_elapsed = 0
-    while not q.empty():
-        _, bytes_up, elapsed = q.get()
-        total_bytes += bytes_up
-        max_elapsed = max(max_elapsed, elapsed)
-
+    # 成绩以累计器为准（与仪表同一数据源），避免和队列汇总不一致
+    total_bytes = acc.total
     transfer_secs = acc.transfer_elapsed()
     if transfer_secs >= 0.5 and total_bytes > 0:
         return total_bytes, total_bytes / transfer_secs * 8 / 1_000_000
-    if max_elapsed >= 0.5 and total_bytes > 0:
-        return total_bytes, total_bytes / max_elapsed * 8 / 1_000_000
+
+    # 兜底：线程回报
+    max_elapsed = 0
+    queued = 0
+    while not q.empty():
+        _, bytes_up, elapsed = q.get()
+        queued += bytes_up
+        max_elapsed = max(max_elapsed, elapsed)
+    if max_elapsed >= 0.5 and queued > 0:
+        return queued, queued / max_elapsed * 8 / 1_000_000
     return 0, 0
 
 
@@ -823,7 +834,27 @@ class SpeedTestApp:
             return
         self.stop_event.set()
         self._update_status("正在停止...")
-        self.root.after(0, lambda: self.btn_start.config(state="disabled", text="停止中..."))
+        # 必须在主线程改按钮；收工后也由主线程轮询复位（后台 after 在 Windows 上不可靠）
+        try:
+            self.btn_start.config(state="disabled", text="停止中...")
+        except Exception:
+            pass
+        self._schedule_idle_button()
+
+    def _schedule_idle_button(self):
+        """主线程等待 is_testing 结束后恢复「开始测速」"""
+        if self._closing:
+            return
+        if not self.is_testing:
+            try:
+                self.btn_start.config(state="normal", text="开始测速")
+                # 后台线程的状态更新若丢失，主线程补上
+                if self.status_var.get() == "正在停止...":
+                    self.status_var.set("测试已停止")
+            except Exception:
+                pass
+            return
+        self.root.after(100, self._schedule_idle_button)
 
     def on_close(self):
         """右上角关闭：先停测速再销毁窗口，避免线程/动画悬挂"""
@@ -832,8 +863,14 @@ class SpeedTestApp:
         self._closing = True
         self.stop_event.set()
         self._stop_all_dots()
-        self.gauge.reset()
-        self._update_status("正在退出...")
+        try:
+            self.gauge.reset()
+        except Exception:
+            pass
+        try:
+            self.status_var.set("正在退出...")
+        except Exception:
+            pass
         # 给工作线程一点时间收工关连接
         self.root.after(200, self._destroy_app)
 
@@ -849,9 +886,7 @@ class SpeedTestApp:
             pass
 
     def _gauge_speed(self, mbps, mode):
-        if self._closing:
-            return
-        self.root.after(0, lambda m=mbps, md=mode: self.gauge.set_speed(m, md))
+        self._ui(lambda m=mbps, md=mode: self.gauge.set_speed(m, md))
 
     def _stopped(self):
         return self.stop_event.is_set() or self._closing
@@ -959,20 +994,21 @@ class SpeedTestApp:
             report = self._generate_report(results)
             self._set_report(report)
             if not self._closing:
-                self.root.after(0, self._show_report)
+                self._ui(self._show_report)
 
         except Exception as e:
-            self._update_status(f"测速失败：{e}")
-            self._gauge_speed(0, "")
+            if not self._closing:
+                self._update_status(f"测速失败：{e}")
+                self._gauge_speed(0, "")
         finally:
             self._stop_all_dots()
             # 若停止时现况还停在「等待中/测试中」动画文案，收成静默状态
-            if stopped:
+            if stopped and not self._closing:
                 self._finalize_stopped_status(results)
                 self._update_status("测试已停止")
             self.is_testing = False
-            if not self._closing:
-                self.root.after(0, lambda: self.btn_start.config(state="normal", text="开始测速"))
+            # 按钮复位交给主线程轮询（_schedule_idle_button）
+            self._ui(self._schedule_idle_button)
 
     def _finalize_stopped_status(self, results):
         if "download" in results:
@@ -1021,27 +1057,31 @@ class SpeedTestApp:
   综合评级：{grade}
 ╚══════════════════════════════════════╝"""
 
-    def _update_status(self, text):
+    def _ui(self, fn):
+        """投递到主线程；窗口关闭中则忽略，避免后台线程炸异常"""
         if self._closing:
             return
-        self.root.after(0, lambda: self.status_var.set(text))
+        try:
+            self.root.after(0, fn)
+        except Exception:
+            pass
+
+    def _update_status(self, text):
+        self._ui(lambda: self.status_var.set(text))
 
     def _update_progress(self, value):
-        if self._closing:
-            return
-        self.root.after(0, lambda: self.progress.config(value=value))
+        self._ui(lambda: self.progress.config(value=value))
 
     def _set_status_text(self, key, text):
         """设置现况文案（会先停掉对应省略号动画）"""
         self._stop_dots(key)
         var = {"download": self.download_var, "upload": self.upload_var}.get(key)
-        if var is not None and not self._closing:
-            self.root.after(0, lambda: var.set(text))
+        if var is not None:
+            self._ui(lambda v=var, t=text: v.set(t))
 
     def _update_realtime(self, text):
         self._stop_dots("realtime")
-        if not self._closing:
-            self.root.after(0, lambda: self.realtime_var.set(text))
+        self._ui(lambda: self.realtime_var.set(text))
 
     def _start_dots(self, key, base_text):
         self._stop_dots(key)
@@ -1068,15 +1108,15 @@ class SpeedTestApp:
             self._stop_dots(key)
 
     def _set_report(self, text):
-        if self._closing:
-            return
-
         def _do():
-            self.report_text.config(state="normal")
-            self.report_text.delete("1.0", "end")
-            self.report_text.insert("1.0", text)
-            self.report_text.config(state="disabled")
-        self.root.after(0, _do)
+            try:
+                self.report_text.config(state="normal")
+                self.report_text.delete("1.0", "end")
+                self.report_text.insert("1.0", text)
+                self.report_text.config(state="disabled")
+            except Exception:
+                pass
+        self._ui(_do)
 
 
 def _app_icon_path():
