@@ -1270,7 +1270,7 @@ class SpeedTestApp:
             self._update_progress(15)
 
             # 下载阶段：只用择优源
-            self._update_status(f"正在测试下载速度（{DOWNLOAD_DURATION}秒）")
+            self._update_status("正在测试下载速度")
             self._start_dots("download", "下载速度：测试中")
             self._gauge_speed(0, "下载", snap=True)
             dl_gen = self._gauge_gen
@@ -1326,12 +1326,12 @@ class SpeedTestApp:
                 self.probe_session.wait_for_sample(5.0, stop_event=self.stop_event)
             if not self._stopped():
                 time.sleep(0.5)
-            self._update_status(f"正在测试上传速度（{UPLOAD_DURATION}秒）")
+            self._update_status("正在测试上传速度")
             self._start_dots("upload", "上传速度：测试中")
             self._gauge_speed(0, "上传", snap=True)
             ul_gen = self._gauge_gen
 
-            total_up, ul_speed = measure_upload_timed(
+            _, ul_speed = measure_upload_timed(
                 UPLOAD_URL, duration=UPLOAD_DURATION, threads=8,
                 callback=None,
                 progress_callback=lambda mbps, g=ul_gen: self._gauge_speed(
@@ -1346,7 +1346,7 @@ class SpeedTestApp:
                 time.sleep(0.5)
                 self._gauge_speed(0, "上传", snap=True)
                 ul_gen = self._gauge_gen
-                total_up, ul_speed = measure_upload_timed(
+                _, ul_speed = measure_upload_timed(
                     UPLOAD_URL, duration=UPLOAD_DURATION, threads=12,
                     callback=None,
                     progress_callback=lambda mbps, g=ul_gen: self._gauge_speed(
@@ -1367,9 +1367,6 @@ class SpeedTestApp:
             results["upload"] = ul_speed
             self._set_status_text("upload", f"上传速度：{ul_speed:.2f} Mbps")
             self._gauge_speed(ul_speed, "上传", snap=True)
-            self._update_realtime(
-                f"上传完成: {total_up/1_000_000:.1f}MB / {UPLOAD_DURATION}s = {ul_speed:.2f} Mbps"
-            )
             self._update_progress(95)
 
             self._update_progress(100)
