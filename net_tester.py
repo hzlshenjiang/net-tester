@@ -51,7 +51,13 @@ PROBE_TIMEOUT = 3
 
 
 class ByteAccumulator:
-    """线程安全的字节累计器，用于计算近 1 秒瞬时速度"""
+    """线程安全的字节累计器，供仪表盘读取稳定速度"""
+
+    # 开测后预热，避免极短时间内字节/时间被放大成虚高
+    WARMUP_SEC = 0.8
+    # 瞬时窗口加长，并强制最短分母，抑制突发尖峰
+    WINDOW_SEC = 2.0
+    MIN_WINDOW_SEC = 0.6
 
     def __init__(self):
         self._lock = threading.Lock()
@@ -66,29 +72,22 @@ class ByteAccumulator:
             self._t0 = time.time()
 
     def add(self, n):
+        if n <= 0:
+            return
         now = time.time()
         with self._lock:
             if self._t0 is None:
                 self._t0 = now
             self.total += n
             self._window.append((now, n))
-            cutoff = now - 1.0
+            cutoff = now - self.WINDOW_SEC
             self._window = [(t, b) for t, b in self._window if t >= cutoff]
 
-    def instant_mbps(self):
-        """近 1 秒窗口瞬时速度（Mbps）"""
-        now = time.time()
+    def elapsed(self):
         with self._lock:
-            if not self._window:
+            if self._t0 is None:
                 return 0.0
-            cutoff = now - 1.0
-            recent = [(t, b) for t, b in self._window if t >= cutoff]
-            if not recent:
-                return 0.0
-            total = sum(b for _, b in recent)
-            t0 = recent[0][0]
-            elapsed = max(now - t0, 0.08)
-            return total / elapsed * 8 / 1_000_000
+            return max(time.time() - self._t0, 0.0)
 
     def average_mbps(self):
         """从开始到现在的平均速度（Mbps）"""
@@ -96,8 +95,36 @@ class ByteAccumulator:
         with self._lock:
             if self._t0 is None or self.total <= 0:
                 return 0.0
-            elapsed = max(now - self._t0, 0.08)
+            elapsed = max(now - self._t0, 0.001)
             return self.total / elapsed * 8 / 1_000_000
+
+    def display_mbps(self, prefer_average=False):
+        """仪表盘用速度：预热后以均速为主，避免指针虚高/在 0~峰值间抽动"""
+        now = time.time()
+        with self._lock:
+            if self._t0 is None or self.total <= 0:
+                return 0.0
+            elapsed = now - self._t0
+            if elapsed < self.WARMUP_SEC:
+                return 0.0
+
+            avg = self.total / elapsed * 8 / 1_000_000
+
+            cutoff = now - self.WINDOW_SEC
+            recent = [(t, b) for t, b in self._window if t >= cutoff]
+            if len(recent) < 2:
+                return avg
+
+            w_elapsed = max(now - recent[0][0], self.MIN_WINDOW_SEC)
+            instant = sum(b for _, b in recent) / w_elapsed * 8 / 1_000_000
+
+            # 上传包间隔明显：几乎只看均速，指针才会贴着峰值走
+            if prefer_average:
+                return avg * 0.9 + instant * 0.1
+            # 下载前几秒仍偏均速，稳住后再略加瞬时跟手感
+            if elapsed < 2.5:
+                return avg * 0.88 + instant * 0.12
+            return avg * 0.6 + instant * 0.4
 
 
 def measure_ping(host, port=443, count=5, timeout=5):
@@ -233,14 +260,22 @@ def measure_download_timed(urls, duration=DOWNLOAD_DURATION, threads_per_url=8,
     if callback:
         callback(f"下载中: {len(urls)}个源 × {threads_per_url}线程 = {total_threads}连接")
 
-    # 轮询瞬时速度，直到线程结束
+    # 轮询稳定速度，直到线程结束；EMA 再压一层尖峰
     deadline = time.time() + duration + 10
+    ema = 0.0
+    ema_ready = False
     while any(t.is_alive() for t in workers) and time.time() < deadline:
         if progress_callback:
-            # 瞬时与平均加权，指针更稳、又不失爬坡感
-            instant = acc.instant_mbps()
-            avg = acc.average_mbps()
-            progress_callback(instant * 0.65 + avg * 0.35)
+            raw = acc.display_mbps(prefer_average=False)
+            if raw <= 0 and not ema_ready:
+                progress_callback(0.0)
+            else:
+                if not ema_ready:
+                    ema = raw
+                    ema_ready = True
+                else:
+                    ema = ema * 0.8 + raw * 0.2
+                progress_callback(ema)
         time.sleep(0.1)
 
     for t in workers:
@@ -260,16 +295,42 @@ def measure_download_timed(urls, duration=DOWNLOAD_DURATION, threads_per_url=8,
     return total_bytes, speed_mbps
 
 
-class TimedUploader(threading.Thread):
-    """按时间上传——持续 POST 数据，统计总字节数"""
+class UploadStream:
+    """可被 urllib 边读边发的上传体：按块记账，避免整包完成才跳变"""
 
-    def __init__(self, url, duration, result_queue, thread_id, chunk_size=512*1024, accumulator=None):
+    def __init__(self, total_size, chunk_size, accumulator):
+        self.total_size = total_size
+        self.sent = 0
+        self.chunk = b"0" * chunk_size
+        self.accumulator = accumulator
+
+    def read(self, size=-1):
+        if self.sent >= self.total_size:
+            return b""
+        if size is None or size < 0:
+            size = len(self.chunk)
+        n = min(size, self.total_size - self.sent, len(self.chunk))
+        if n <= 0:
+            return b""
+        self.sent += n
+        if self.accumulator:
+            self.accumulator.add(n)
+        return self.chunk[:n]
+
+
+class TimedUploader(threading.Thread):
+    """按时间上传——大包 POST，发送过程中按块累计字节"""
+
+    # 单次 POST 4MB，减少请求间隙；读块 64KB，仪表盘可平滑上涨
+    PAYLOAD_SIZE = 4 * 1024 * 1024
+    READ_CHUNK = 64 * 1024
+
+    def __init__(self, url, duration, result_queue, thread_id, accumulator=None):
         super().__init__(daemon=True)
         self.url = url
         self.duration = duration
         self.result_queue = result_queue
         self.thread_id = thread_id
-        self.chunk = b"0" * chunk_size
         self.accumulator = accumulator
         self._should_stop = False
 
@@ -280,18 +341,26 @@ class TimedUploader(threading.Thread):
         total_bytes = 0
         start = time.time()
         try:
-            # 每次上传 512KB，持续 duration 秒
             while not self._should_stop and (time.time() - start) < self.duration:
+                body = UploadStream(self.PAYLOAD_SIZE, self.READ_CHUNK, self.accumulator)
                 req = urllib.request.Request(
-                    self.url, data=self.chunk,
-                    headers={"User-Agent": "Mozilla/5.0", "Content-Type": "application/octet-stream"},
+                    self.url, data=body,
+                    headers={
+                        "User-Agent": "Mozilla/5.0",
+                        "Content-Type": "application/octet-stream",
+                        "Content-Length": str(self.PAYLOAD_SIZE),
+                    },
                     method="POST",
                 )
-                with urllib.request.urlopen(req, timeout=15, context=_ctx) as resp:
-                    resp.read()
-                total_bytes += len(self.chunk)
-                if self.accumulator:
-                    self.accumulator.add(len(self.chunk))
+                try:
+                    with urllib.request.urlopen(req, timeout=30, context=_ctx) as resp:
+                        resp.read()
+                    total_bytes += body.sent
+                except Exception:
+                    # 超时/中断时仍计入已发出的字节
+                    total_bytes += body.sent
+                    if time.time() - start >= self.duration:
+                        break
         except Exception:
             pass
         elapsed = time.time() - start
@@ -311,11 +380,21 @@ def measure_upload_timed(url, duration=UPLOAD_DURATION, threads=8,
         t.start()
 
     deadline = time.time() + duration + 10
+    ema = 0.0
+    ema_ready = False
     while any(t.is_alive() for t in workers) and time.time() < deadline:
         if progress_callback:
-            instant = acc.instant_mbps()
-            avg = acc.average_mbps()
-            progress_callback(instant * 0.65 + avg * 0.35)
+            # 上传以均速为主，请求间隙不会掉回 0
+            raw = acc.display_mbps(prefer_average=True)
+            if raw <= 0 and not ema_ready:
+                progress_callback(0.0)
+            else:
+                if not ema_ready:
+                    ema = raw
+                    ema_ready = True
+                else:
+                    ema = ema * 0.85 + raw * 0.15
+                progress_callback(ema)
         time.sleep(0.1)
 
     for t in workers:
@@ -366,8 +445,12 @@ class DotAnimator:
 class SpeedGauge:
     """汽车仪表盘式网速表：指针平滑扫动，显示实时 Mbps"""
 
-    # 量程档位（自适应抬升）
-    SCALE_TIERS = (100, 200, 500, 1000, 2000, 5000)
+    # 默认按家用带宽常见区间铺满；超过再抬档
+    SCALE_TIERS = (1000, 2000, 5000)
+    DEFAULT_MAX = 1000.0
+    # 0~500Mbps 占表盘 72%（刻度疏），500~满量程占 28%（刻度密）
+    LOW_BAND = 500.0
+    LOW_SHARE = 0.72
     # 指针扫过角度：从左下 225° 到右下 -45°（共 270°）
     START_ANGLE = 225.0
     SWEEP = 270.0
@@ -383,7 +466,7 @@ class SpeedGauge:
         )
         self.canvas.pack(fill="both", expand=True)
 
-        self.max_mbps = 100.0
+        self.max_mbps = self.DEFAULT_MAX
         self.target = 0.0
         self.current = 0.0
         self.mode = ""  # 下载 / 上传 / 空
@@ -397,12 +480,12 @@ class SpeedGauge:
 
     def _tier_for(self, speed):
         for t in self.SCALE_TIERS:
-            if speed <= t * 0.85:
+            if speed <= t * 0.92:
                 return t
         return self.SCALE_TIERS[-1]
 
     def reset(self):
-        self.max_mbps = 100.0
+        self.max_mbps = self.DEFAULT_MAX
         self.target = 0.0
         self.current = 0.0
         self.mode = ""
@@ -427,9 +510,46 @@ class SpeedGauge:
         if self._anim_job is None:
             self._tick()
 
+    def speed_to_ratio(self, mbps):
+        """速度 → 表盘比例（非线性）：常用低速区占更大弧长"""
+        mbps = max(0.0, float(mbps))
+        max_s = self.max_mbps
+        if max_s <= self.LOW_BAND:
+            return min(mbps / max_s, 1.0) if max_s > 0 else 0.0
+
+        if mbps <= self.LOW_BAND:
+            return (mbps / self.LOW_BAND) * self.LOW_SHARE
+
+        high = max_s - self.LOW_BAND
+        if high <= 0:
+            return 1.0
+        return self.LOW_SHARE + min((mbps - self.LOW_BAND) / high, 1.0) * (1.0 - self.LOW_SHARE)
+
     def _speed_to_angle(self, mbps):
-        ratio = min(max(mbps / self.max_mbps, 0.0), 1.0)
-        return self.START_ANGLE - ratio * self.SWEEP
+        return self.START_ANGLE - self.speed_to_ratio(mbps) * self.SWEEP
+
+    def _major_tick_values(self):
+        """主刻度数值：0-500 疏，500 以上密"""
+        max_s = int(self.max_mbps)
+        ticks = [0, 50, 100, 200, 300, 400, 500]
+        if max_s <= 500:
+            return [t for t in ticks if t <= max_s] + ([max_s] if max_s not in ticks else [])
+
+        # 500 以上按量程补点，间距更紧
+        if max_s <= 1000:
+            ticks += [750, 1000]
+        elif max_s <= 2000:
+            ticks += [750, 1000, 1500, 2000]
+        else:
+            ticks += [750, 1000, 2000, 3500, 5000]
+        # 去重并裁到量程
+        out = []
+        for t in ticks:
+            if t <= max_s and t not in out:
+                out.append(t)
+        if out[-1] != max_s:
+            out.append(max_s)
+        return out
 
     def _polar(self, angle_deg, r):
         rad = math.radians(angle_deg)
@@ -458,24 +578,31 @@ class SpeedGauge:
             outline="#1a2336", width=self.scale(14), tags="static",
         )
 
-        # 色带：低速青绿 → 中速琥珀 → 高速玫红
-        zones = [
-            (0.00, 0.45, "#1ec8a5"),
-            (0.45, 0.75, "#f0a202"),
-            (0.75, 1.00, "#ff4d6d"),
+        # 色带按真实速度分段，再映射到非线性弧长
+        # 0-200 青绿 · 200-500 琥珀 · 500+ 玫红
+        speed_zones = [
+            (0.0, min(200.0, self.max_mbps), "#1ec8a5"),
+            (min(200.0, self.max_mbps), min(500.0, self.max_mbps), "#f0a202"),
+            (min(500.0, self.max_mbps), self.max_mbps, "#ff4d6d"),
         ]
-        for a0, a1, color in zones:
+        for s0, s1, color in speed_zones:
+            if s1 <= s0:
+                continue
+            a0 = self.speed_to_ratio(s0)
+            a1 = self.speed_to_ratio(s1)
             start = self.START_ANGLE - a0 * self.SWEEP
             extent = (a1 - a0) * self.SWEEP
+            if extent <= 0:
+                continue
             self._create_arc(
                 r, start, extent,
                 outline=color, width=self.scale(10), tags="static",
             )
 
-        # 刻度与数字
-        majors = 10
-        for i in range(majors + 1):
-            ratio = i / majors
+        # 主刻度（按速度值非线性落位）
+        majors = self._major_tick_values()
+        for i, val in enumerate(majors):
+            ratio = self.speed_to_ratio(val)
             ang = self.START_ANGLE - ratio * self.SWEEP
             outer = self._polar(ang, r + self.scale(2))
             inner = self._polar(ang, r - self.scale(16))
@@ -484,16 +611,18 @@ class SpeedGauge:
                 fill="#dce6f5", width=self.scale(2), tags="static",
             )
             label_pos = self._polar(ang, r - self.scale(30))
-            val = int(round(self.max_mbps * ratio))
             c.create_text(
-                *label_pos, text=str(val),
+                *label_pos, text=str(int(val)),
                 fill="#9fb3d1", font=("Consolas", self.scale(8)),
                 tags="static",
             )
-            # 小刻度
-            if i < majors:
-                for j in range(1, 5):
-                    rr = ratio + j / (majors * 5)
+            # 相邻主刻度之间插小刻度
+            if i < len(majors) - 1:
+                v0, v1 = majors[i], majors[i + 1]
+                steps = 4 if (v1 - v0) >= 100 else 2
+                for j in range(1, steps):
+                    vv = v0 + (v1 - v0) * j / steps
+                    rr = self.speed_to_ratio(vv)
                     aang = self.START_ANGLE - rr * self.SWEEP
                     o2 = self._polar(aang, r + self.scale(1))
                     i2 = self._polar(aang, r - self.scale(8))
@@ -518,8 +647,6 @@ class SpeedGauge:
 
     def _create_arc(self, r, start_angle, extent, **kwargs):
         """按数学角度画弧（Canvas 的 start 是 3 点钟方向逆时针）"""
-        # Canvas: 0°=3点钟，正方向逆时针；我们用数学角（0°=3点钟，正方向逆时针）一致
-        # 但 create_arc 的 extent 正值是逆时针；我们的 sweep 是顺时针减小角度
         # start_angle 是数学角，extent 是顺时针扫过的度数 → Canvas 用负 extent
         cx, cy = self._cx, self._cy
         self.canvas.create_arc(
@@ -534,9 +661,9 @@ class SpeedGauge:
         cx, cy, r = self._cx, self._cy, self._radius
         ang = self._speed_to_angle(mbps)
 
-        # 已走过的高亮弧
+        # 已走过的高亮弧（跟随非线性比例）
         if mbps > 0.5:
-            ratio = min(mbps / self.max_mbps, 1.0)
+            ratio = self.speed_to_ratio(mbps)
             self._create_arc(
                 r, self.START_ANGLE, ratio * self.SWEEP,
                 outline="#7ee8ff", width=self.scale(3), tags="dyn",
@@ -564,7 +691,7 @@ class SpeedGauge:
             fill="#ff6b35", outline="#ffffff", width=1, tags="dyn",
         )
 
-        # 模式与数字读数
+        # 模式与数字读数（与指针同一 current，保证一致）
         mode_text = self.mode if self.mode else "待机"
         mode_color = "#7ee8ff" if self.mode == "下载" else ("#f0a202" if self.mode == "上传" else "#6b7c93")
         c.create_text(
@@ -584,14 +711,15 @@ class SpeedGauge:
         )
 
     def _tick(self):
-        # 指数平滑追赶目标，有汽车仪表的阻尼感
+        # 指数平滑追赶目标；上行稍快、下行稍慢，减少“先冲高再回落”的观感
         diff = self.target - self.current
-        if abs(diff) < 0.05:
+        if abs(diff) < 0.08:
             self.current = self.target
             self._draw_dynamic(self.current)
             self._anim_job = None
             return
-        self.current += diff * 0.28
+        factor = 0.22 if diff > 0 else 0.32
+        self.current += diff * factor
         self._draw_dynamic(self.current)
         self._anim_job = self.canvas.after(33, self._tick)
 
