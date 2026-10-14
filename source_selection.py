@@ -357,6 +357,7 @@ class ProbeSession:
         self._sample_mbps = 0.0
         self._sample_ok = False
         self._sample_done = False
+        self._sampling = False  # 摸底进行中，禁止嵌套/并发再摸底
         self._silent_updates = True
         self._status_hint = ""
 
@@ -391,6 +392,12 @@ class ProbeSession:
             return self._sample_done
 
     @property
+    def sampling(self) -> bool:
+        """是否正在跑带宽摸底（正式上下载前应等到 False）。"""
+        with self._lock:
+            return self._sampling
+
+    @property
     def status_hint(self) -> str:
         with self._lock:
             return self._status_hint
@@ -408,6 +415,7 @@ class ProbeSession:
             self._sample_mbps = 0.0
             self._sample_ok = False
             self._sample_done = False
+            self._sampling = False
             self._status_hint = ""
             self._generation += 1
             self._cond.notify_all()
@@ -417,15 +425,15 @@ class ProbeSession:
         timeout: float = 1.0,
         stop_event: Optional[threading.Event] = None,
     ) -> bool:
-        """开测前短等摸底；超时返回当前是否已完成。"""
+        """开测前短等摸底结束（含禁止与正式下载叠流的 sampling 段）。"""
         deadline = time.time() + max(0.0, timeout)
         with self._cond:
-            while not self._sample_done:
+            while (not self._sample_done) or self._sampling:
                 if stop_event is not None and stop_event.is_set():
-                    return self._sample_done
+                    return self._sample_done and (not self._sampling)
                 remain = deadline - time.time()
                 if remain <= 0:
-                    return self._sample_done
+                    return self._sample_done and (not self._sampling)
                 self._cond.wait(timeout=min(0.1, remain))
             return True
 
@@ -506,7 +514,13 @@ class ProbeSession:
             self._results = list(full)
             new_selected = pick_optimal_sources(full)
             self._selected = list(new_selected)
-            if (not self._sample_ok) and len(new_selected) >= 3:
+            # 仅「摸底已结束且不合格」才补摸；摸底进行中绝对不能再开一轮（会和正式下载互抢→0）
+            if (
+                self._sample_done
+                and (not self._sample_ok)
+                and (not self._sampling)
+                and len(new_selected) >= 3
+            ):
                 need_resample = True
             self._cond.notify_all()
         if need_resample:
@@ -519,35 +533,43 @@ class ProbeSession:
                 pass
 
     def _run_bandwidth_sample(self, stop_event: Optional[threading.Event]) -> None:
-        with self._lock:
+        with self._cond:
+            if self._sampling:
+                return
+            self._sampling = True
             urls = [u for _, u, _ in self._selected]
             sample_fn = self._sample_fn
         mbps = 0.0
         ok = len(urls) >= 3
-        if sample_fn is not None and urls:
-            try:
-                mbps = float(sample_fn(urls, stop_event=stop_event))
-            except Exception:
-                mbps = 0.0
+        try:
+            if sample_fn is not None and urls:
+                try:
+                    mbps = float(sample_fn(urls, stop_event=stop_event))
+                except Exception:
+                    mbps = 0.0
+                    ok = False
+            elif not urls:
                 ok = False
-        elif not urls:
-            ok = False
-        else:
-            # 无 sample_fn：不实测，仅按源数标记是否具备摸底条件
-            ok = len(urls) >= 3
-            mbps = 0.0
-
-        with self._cond:
-            self._sample_mbps = mbps
-            if sample_fn is None:
-                # 未注入摸底：不定高带宽档；sample_ok=False 以便日后注入后可补摸
-                self._sample_ok = False
-                self._high_bandwidth = False
             else:
-                self._sample_ok = bool(ok)
-                self._high_bandwidth = bool(ok and mbps >= HIGH_BW_SAMPLE_MBPS)
-            self._sample_done = True
-            self._cond.notify_all()
+                # 无 sample_fn：不实测，仅按源数标记是否具备摸底条件
+                ok = len(urls) >= 3
+                mbps = 0.0
+
+            with self._cond:
+                self._sample_mbps = mbps
+                if sample_fn is None:
+                    # 未注入摸底：不定高带宽档；sample_ok=False 以便日后注入后可补摸
+                    self._sample_ok = False
+                    self._high_bandwidth = False
+                else:
+                    self._sample_ok = bool(ok)
+                    self._high_bandwidth = bool(ok and mbps >= HIGH_BW_SAMPLE_MBPS)
+                self._sample_done = True
+                self._cond.notify_all()
+        finally:
+            with self._cond:
+                self._sampling = False
+                self._cond.notify_all()
 
     def selected_urls(self) -> List[str]:
         with self._lock:

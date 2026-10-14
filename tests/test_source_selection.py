@@ -426,6 +426,45 @@ class TestBandwidthSample(unittest.TestCase):
         self.assertEqual(samples["n"], 1)
         self.assertTrue(session.high_bandwidth)
 
+    def test_silent_merge_during_sample_does_not_nest_sample(self):
+        """摸底进行中静默补全不得再开摸底，否则会与正式上下载叠流→0。"""
+        import threading
+        import time
+
+        samples = {"n": 0}
+        in_sample = threading.Event()
+        release = threading.Event()
+
+        def ping(sources, stop_event=None):
+            return [(n, u, 10.0 + i) for i, (n, u) in enumerate(sources)]
+
+        def sample(urls, stop_event=None):
+            samples["n"] += 1
+            in_sample.set()
+            release.wait(timeout=2.0)
+            return 120.0
+
+        session = ProbeSession(ping_fn=ping, sample_fn=sample)
+        t = threading.Thread(target=lambda: session.ensure_probed("south_china"))
+        t.start()
+        self.assertTrue(in_sample.wait(timeout=2))
+        # 摸底尚未结束时静默合并
+        full = [
+            ("A", "https://a", 10.0),
+            ("B", "https://b", 12.0),
+            ("C", "https://c", 14.0),
+            ("D", "https://d", 16.0),
+        ]
+        session._merge_silent_results(full, session._generation)
+        time.sleep(0.05)
+        self.assertEqual(samples["n"], 1)
+        self.assertTrue(session.sampling)
+        release.set()
+        t.join(timeout=3)
+        self.assertTrue(session.sample_done)
+        self.assertEqual(samples["n"], 1)
+        self.assertFalse(session.sampling)
+
     def test_resample_only_when_prior_sample_invalid(self):
         samples = {"n": 0}
 

@@ -874,7 +874,7 @@ class SpeedTestApp:
         self.btn_start.config(state="normal", text="停止测试")
         # 测速中禁止换区 / 重探 / 自动定位，避免踩坏会话缓存
         self._set_region_controls_enabled(False)
-        self.probe_session.set_silent_updates(False)
+        # 注意：静默补探要等节点就绪后再冻结，否则探测中开测会锁死在早期烂源→上下载 0
         self.progress["value"] = 0
         self.realtime_var.set("")
         self._set_report("")
@@ -1094,7 +1094,10 @@ class SpeedTestApp:
                 self._probing = False
 
     def _wait_probe_ready(self, timeout: float = 8.0) -> bool:
-        """开测前确保会话已探测+摸底；必要时补探，摸底最多再等约 1 秒。"""
+        """开测前确保会话已探测+摸底；必要时补探。
+
+        必须等摸底线程真正结束再开正式下载，否则会与摸底抢带宽出现 0 Mbps。
+        """
         region = getattr(self, "_test_region_id", None) or DEFAULT_REGION
         need = not (
             self.probe_session.ready
@@ -1103,11 +1106,20 @@ class SpeedTestApp:
             and self.probe_session.sample_done
         )
         if need:
-            # ensure_probed 与后台预热串行；含轻量摸底
             self._update_status("正在探测节点并摸底带宽…")
             self.probe_session.ensure_probed(region, stop_event=self.stop_event)
-        # 摸底尚未完成时最多再等 1 秒，超时则按当前 high_bandwidth（多为 False）开测
+        # 先短等；若仍在 sampling，再等到结束（防呆：与正式上/下载叠流会出现 0 Mbps）
         self.probe_session.wait_for_sample(1.0, stop_event=self.stop_event)
+        if (not self.probe_session.sample_done) or self.probe_session.sampling:
+            self.probe_session.wait_for_sample(5.0, stop_event=self.stop_event)
+        # 源偏少时再等静默补探凑源（此时尚未 freeze silent_updates）
+        if len(self.probe_session.selected_urls()) < 3:
+            for _ in range(20):
+                if self._stopped():
+                    break
+                if len(self.probe_session.selected_urls()) >= 3:
+                    break
+                time.sleep(0.1)
         return bool(self.probe_session.selected_urls())
 
     def _run_test(self):
@@ -1130,6 +1142,8 @@ class SpeedTestApp:
                 stopped = True
                 return
 
+            # 节点已就绪：冻结静默换源，再快照择优列表供本轮上下载使用
+            self.probe_session.set_silent_updates(False)
             selected = self.probe_session.selected_results()
             node_info = self.probe_session.summary_text()
             self._update_realtime(f"节点延迟：{node_info}")
@@ -1143,6 +1157,9 @@ class SpeedTestApp:
             self._gauge_speed(0, "下载")
 
             urls = [u for _, u, _ in selected]
+            # 防呆：摸底未结束不开正式下载（叠流会出现下载/上传 0 Mbps）
+            if self.probe_session.sampling or not self.probe_session.sample_done:
+                self.probe_session.wait_for_sample(5.0, stop_event=self.stop_event)
             # 接线硬约束：会话摸底 high_bandwidth 必须进入正式下载规划
             high_bw = bool(self.probe_session.high_bandwidth)
             total_bytes, dl_speed = measure_download_timed(
@@ -1152,6 +1169,19 @@ class SpeedTestApp:
                 stop_event=self.stop_event,
                 high_bandwidth=high_bw,
             )
+
+            # 探测中开测偶发叠流/烂源导致 0：歇一下用当前择优再测一轮
+            if not self._stopped() and dl_speed < 1.0 and urls:
+                self._update_realtime("下载接近 0，0.5s 后重试…")
+                time.sleep(0.5)
+                self._gauge_speed(0, "下载")
+                total_bytes, dl_speed = measure_download_timed(
+                    urls, duration=DOWNLOAD_DURATION,
+                    callback=lambda msg: self._update_realtime(msg),
+                    progress_callback=lambda mbps: self._gauge_speed(mbps, "下载"),
+                    stop_event=self.stop_event,
+                    high_bandwidth=high_bw,
+                )
 
             if self._stopped():
                 stopped = True
@@ -1167,7 +1197,11 @@ class SpeedTestApp:
             self._gauge_speed(dl_speed, "下载")
             self._update_progress(60)
 
-            # 上传阶段：上传「测试中...」
+            # 上传阶段：避开残留摸底；下载大并发后稍歇，降低上传被打成 0 的概率
+            if self.probe_session.sampling:
+                self.probe_session.wait_for_sample(5.0, stop_event=self.stop_event)
+            if not self._stopped():
+                time.sleep(0.5)
             self._update_status(f"正在测试上传速度（{UPLOAD_DURATION}秒）")
             self._start_dots("upload", "上传速度：测试中")
             self._gauge_speed(0, "上传")
@@ -1179,9 +1213,10 @@ class SpeedTestApp:
                 stop_event=self.stop_event,
             )
 
-            # 偏低时加线程重测（可被停止打断）
+            # 偏低或 0：歇一下再加线程重测（探测中开测后更易踩中）
             if not self._stopped() and ul_speed < 10:
-                self._update_realtime(f"上传 {ul_speed:.0f} Mbps 偏低，12 线程重试...")
+                self._update_realtime(f"上传 {ul_speed:.0f} Mbps 偏低，0.5s 后 12 线程重试...")
+                time.sleep(0.5)
                 self._gauge_speed(0, "上传")
                 total_up, ul_speed = measure_upload_timed(
                     UPLOAD_URL, duration=UPLOAD_DURATION, threads=12,
@@ -1320,28 +1355,38 @@ class SpeedTestApp:
         self._ui(lambda: self.realtime_var.set(text))
 
     def _start_dots(self, key, base_text):
-        self._stop_dots(key)
-        var_map = {
-            "download": self.download_var,
-            "upload": self.upload_var,
-            "realtime": self.realtime_var,
-        }
-        var = var_map.get(key)
-        if var is None or self._closing:
-            return
-        anim = DotAnimator(var, base_text, self.root)
-        self.dots[key] = anim
-        anim.start()
+        """必须投递主线程：DotAnimator 内部会 root.after。"""
+        def _do():
+            self._stop_dots_main(key)
+            var_map = {
+                "download": self.download_var,
+                "upload": self.upload_var,
+                "realtime": self.realtime_var,
+            }
+            var = var_map.get(key)
+            if var is None or self._closing:
+                return
+            anim = DotAnimator(var, base_text, self.root)
+            self.dots[key] = anim
+            anim.start()
 
-    def _stop_dots(self, key):
+        self._ui(_do)
+
+    def _stop_dots_main(self, key):
         anim = self.dots.get(key)
         if anim:
             anim.stop()
             self.dots[key] = None
 
+    def _stop_dots(self, key):
+        self._ui(lambda k=key: self._stop_dots_main(k))
+
     def _stop_all_dots(self):
-        for key in list(self.dots.keys()):
-            self._stop_dots(key)
+        def _do():
+            for key in list(self.dots.keys()):
+                self._stop_dots_main(key)
+
+        self._ui(_do)
 
     def _set_report(self, text):
         def _do():
