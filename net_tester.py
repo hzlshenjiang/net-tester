@@ -689,6 +689,7 @@ class SpeedTestApp:
         self.probe_session = ProbeSession()
         self._probe_lock = threading.Lock()
         self._probing = False
+        self._probe_pending = None
         self._ui_queue = Queue()
 
         self._build_ui()
@@ -757,18 +758,22 @@ class SpeedTestApp:
         self.region_combo.bind("<<ComboboxSelected>>", self._on_region_changed)
 
         self.auto_locate_var = tk.BooleanVar(value=bool(self.settings.get("auto_locate", False)))
-        ttk.Checkbutton(
+        self.auto_locate_cb = ttk.Checkbutton(
             row, text="自动定位", variable=self.auto_locate_var,
             command=self._on_auto_locate_toggled,
-        ).pack(side="left", padx=(self.scale(12), 0))
+        )
+        self.auto_locate_cb.pack(side="left", padx=(self.scale(12), 0))
 
         self.btn_reprobe = ttk.Button(row, text="重新探测", command=self._on_reprobe_clicked)
         self.btn_reprobe.pack(side="right")
 
+        # 延迟数字变大时单行会裁切：固定换行宽度，保证三源+高延迟也能看全
+        self._text_wrap = self.scale(500)
         self.sources_var = tk.StringVar(value="测速源：探测中…")
-        ttk.Label(src_frame, textvariable=self.sources_var, font=self._font(9), foreground="gray").pack(
-            anchor="w", pady=(self.scale(4), 0),
-        )
+        ttk.Label(
+            src_frame, textvariable=self.sources_var, font=self._font(9),
+            foreground="gray", wraplength=self._text_wrap, justify="left",
+        ).pack(anchor="w", pady=(self.scale(4), 0), fill="x")
 
         frame = ttk.LabelFrame(self.root, text="测试现况", padding=self.scale(8))
         frame.pack(fill="x", padx=self.scale(30), pady=self.scale(2))
@@ -780,7 +785,10 @@ class SpeedTestApp:
         ttk.Label(frame, textvariable=self.upload_var, font=self._font(12)).pack(anchor="w", pady=self.scale(1))
 
         self.realtime_var = tk.StringVar(value="")
-        ttk.Label(self.root, textvariable=self.realtime_var, font=self._font(9), foreground="blue").pack(pady=self.scale(2))
+        ttk.Label(
+            self.root, textvariable=self.realtime_var, font=self._font(9),
+            foreground="blue", wraplength=self._text_wrap, justify="left",
+        ).pack(pady=self.scale(2), padx=self.scale(30), fill="x")
 
         self.btn_start = ttk.Button(self.root, text="开始测速", command=self.on_button)
         self.btn_start.pack(pady=self.scale(4))
@@ -824,6 +832,8 @@ class SpeedTestApp:
         self.is_testing = True
         self.stop_event.clear()
         self.btn_start.config(state="normal", text="停止测试")
+        # 测速中禁止换区 / 重探 / 自动定位，避免踩坏会话缓存
+        self._set_region_controls_enabled(False)
         self.progress["value"] = 0
         self.realtime_var.set("")
         self._set_report("")
@@ -856,6 +866,7 @@ class SpeedTestApp:
         if not self.is_testing:
             try:
                 self.btn_start.config(state="normal", text="开始测速")
+                self._set_region_controls_enabled(True)
                 # 后台线程的状态更新若丢失，主线程补上
                 if self.status_var.get() == "正在停止...":
                     self.status_var.set("测试已停止")
@@ -863,6 +874,15 @@ class SpeedTestApp:
                 pass
             return
         self.root.after(100, self._schedule_idle_button)
+
+    def _set_region_controls_enabled(self, enabled: bool):
+        """测速期间锁定地区相关控件，防止并发探测踩会话。"""
+        try:
+            self.region_combo.config(state="readonly" if enabled else "disabled")
+            self.btn_reprobe.config(state="normal" if enabled else "disabled")
+            self.auto_locate_cb.config(state="normal" if enabled else "disabled")
+        except Exception:
+            pass
 
     def on_close(self):
         """右上角关闭：先停测速再销毁窗口，避免线程/动画悬挂"""
@@ -915,7 +935,7 @@ class SpeedTestApp:
 
     def _start_background_probe(self):
         """启动或换区后的后台探测。"""
-        if self._closing:
+        if self._closing or self.is_testing:
             return
         region = self._current_region_id()
         auto = bool(self.auto_locate_var.get())
@@ -936,6 +956,8 @@ class SpeedTestApp:
         ).start()
 
     def _on_region_changed(self, _event=None):
+        if self.is_testing:
+            return
         if self.auto_locate_var.get():
             # 手改地区时关闭自动定位，避免下次又被覆盖
             self.auto_locate_var.set(False)
@@ -950,6 +972,9 @@ class SpeedTestApp:
         ).start()
 
     def _on_auto_locate_toggled(self):
+        if self.is_testing:
+            # 控件已禁用；若仍触发则忽略，避免测速中改会话
+            return
         self._persist_settings()
         if not self.auto_locate_var.get():
             return
@@ -961,7 +986,7 @@ class SpeedTestApp:
             label = REGION_LABELS.get(region, "华南")
 
             def _apply():
-                if self._closing:
+                if self._closing or self.is_testing:
                     return
                 self.region_var.set(label)
                 self.settings["region"] = region
@@ -975,45 +1000,61 @@ class SpeedTestApp:
 
     def _probe_worker(self, force: bool, region_id: str, auto_locate: bool):
         with self._probe_lock:
-            if self._probing and not force:
+            # 合并并发探测请求；正在探测时记下待办，结束后再跑一轮
+            if self._probing:
+                self._probe_pending = (region_id, auto_locate, force)
                 return
             self._probing = True
+            self._probe_pending = None
         try:
-            region = resolve_region(
-                {"region": region_id, "auto_locate": auto_locate},
-                locate_fn=locate_region_by_ip if auto_locate else None,
-            )
-            # 若定位改了地区，同步下拉框
-            label = REGION_LABELS.get(region, "华南")
-            self._ui(lambda: self.region_var.set(label))
-
-            selected = self.probe_session.ensure_probed(region)
-            summary = self.probe_session.summary_text()
-
-            def _done():
+            while True:
                 if self._closing:
-                    return
-                if selected:
-                    self.sources_var.set(f"测速源：{summary}")
-                    if not self.is_testing:
-                        self.status_var.set("就绪 — 点击开始测速")
-                else:
-                    self.sources_var.set("测速源：无可用节点")
-                    if not self.is_testing:
-                        self.status_var.set("节点不可达，请检查网络或换地区")
+                    break
+                # 测速已开始：非强制探测退出，交给测速线程 ensure_probed 等待/复用
+                if self.is_testing and not force:
+                    break
+                region = resolve_region(
+                    {"region": region_id, "auto_locate": auto_locate},
+                    locate_fn=locate_region_by_ip if auto_locate else None,
+                )
+                label = REGION_LABELS.get(region, "华南")
+                if not self.is_testing:
+                    self._ui(lambda lab=label: self.region_var.set(lab))
 
-            self._ui(_done)
+                selected = self.probe_session.ensure_probed(region)
+                summary = self.probe_session.summary_text()
+
+                def _done(sel=selected, summ=summary):
+                    if self._closing:
+                        return
+                    if sel:
+                        self.sources_var.set(f"测速源：{summ}")
+                        if not self.is_testing:
+                            self.status_var.set("就绪 — 点击开始测速")
+                    else:
+                        self.sources_var.set("测速源：无可用节点")
+                        if not self.is_testing:
+                            self.status_var.set("节点不可达，请检查网络或换地区")
+
+                self._ui(_done)
+
+                with self._probe_lock:
+                    pending = self._probe_pending
+                    self._probe_pending = None
+                    if not pending or self.is_testing:
+                        break
+                    region_id, auto_locate, force = pending
         finally:
             with self._probe_lock:
                 self._probing = False
 
     def _wait_probe_ready(self, timeout: float = 8.0) -> bool:
-        """开测前确保会话已探测；必要时同步补探。"""
+        """开测前确保会话已探测；必要时等待后台探测或同步补探。"""
         if self.probe_session.ready and self.probe_session.selected_urls():
-            # 地区一致才复用
             if self.probe_session.region == getattr(self, "_test_region_id", None):
                 return True
         region = getattr(self, "_test_region_id", None) or DEFAULT_REGION
+        # ensure_probed 会与后台预热串行：未探测完点开始 → 等同一轮结果，不双开
         self.probe_session.ensure_probed(region, stop_event=self.stop_event)
         return bool(self.probe_session.selected_urls())
 

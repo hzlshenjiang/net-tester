@@ -212,5 +212,87 @@ class TestDownloadWiring(unittest.TestCase):
         self.assertLessEqual(len(selected), 4)
 
 
+class TestProbeSessionConcurrency(unittest.TestCase):
+    """未探测完就开测：两路 ensure 只应真正探测一次，并都能拿到结果。"""
+
+    def test_concurrent_ensure_probes_once(self):
+        import threading
+        import time
+
+        calls = {"n": 0}
+        gate = threading.Event()
+
+        def slow_ping(sources, stop_event=None):
+            calls["n"] += 1
+            gate.wait(timeout=2.0)
+            time.sleep(0.05)
+            return [(n, u, 20.0 + i) for i, (n, u) in enumerate(sources)]
+
+        session = ProbeSession(ping_fn=slow_ping)
+        out = [None, None]
+
+        def worker(i):
+            out[i] = session.ensure_probed("south_china")
+
+        t1 = threading.Thread(target=worker, args=(0,))
+        t2 = threading.Thread(target=worker, args=(1,))
+        t1.start()
+        time.sleep(0.05)  # 让 t1 先进入探测
+        t2.start()
+        gate.set()
+        t1.join(timeout=3)
+        t2.join(timeout=3)
+        self.assertEqual(calls["n"], 1)
+        self.assertTrue(out[0])
+        self.assertEqual(out[0], out[1])
+
+    def test_invalidate_during_probe_discards_stale(self):
+        import threading
+
+        calls = {"n": 0}
+        entered = threading.Event()
+        release = threading.Event()
+
+        def slow_ping(sources, stop_event=None):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                entered.set()
+                release.wait(timeout=2.0)
+                return [(n, u, 15.0) for n, u in sources]
+            # 失效后自动重试的第二轮
+            return [(n, u, 99.0) for n, u in sources]
+
+        session = ProbeSession(ping_fn=slow_ping)
+        result_box = {"r": None}
+
+        def worker():
+            result_box["r"] = session.ensure_probed("south_china")
+
+        t = threading.Thread(target=worker)
+        t.start()
+        self.assertTrue(entered.wait(timeout=2))
+        session.invalidate()
+        release.set()
+        t.join(timeout=3)
+        self.assertTrue(session.ready)
+        self.assertEqual(calls["n"], 2)
+        self.assertEqual(session.selected_results()[0][2], 99.0)
+        self.assertEqual(result_box["r"][0][2], 99.0)
+
+    def test_summary_text_keeps_high_latency_values(self):
+        session = ProbeSession(
+            ping_fn=lambda sources, stop_event=None: [
+                ("腾讯-微信", "https://a", 550.0),
+                ("阿里云镜像", "https://b", 1551.0),
+                ("华为云-Python", "https://c", 3087.0),
+            ]
+        )
+        session.ensure_probed("south_china")
+        text = session.summary_text()
+        self.assertIn("3087ms", text)
+        self.assertIn("1551ms", text)
+        self.assertIn("华为云-Python", text)
+
+
 if __name__ == "__main__":
     unittest.main()

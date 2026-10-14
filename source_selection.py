@@ -212,7 +212,10 @@ def parallel_probe(
 
 
 class ProbeSession:
-    """会话级探测缓存：同地区复用；换区 / invalidate 才重探。"""
+    """会话级探测缓存：同地区复用；换区 / invalidate 才重探。
+
+    并发 ensure_probed 会串行：开测线程可等待后台预热，不会双开探测互相踩。
+    """
 
     def __init__(
         self,
@@ -222,10 +225,13 @@ class ProbeSession:
         self._ping_fn = ping_fn or (lambda sources, stop_event=None: parallel_probe(sources, stop_event))
         self._catalog = catalog
         self._lock = threading.Lock()
+        self._cond = threading.Condition(self._lock)
         self._region: Optional[str] = None
         self._results: List[ProbeResult] = []
         self._selected: List[ProbeResult] = []
         self._ready = False
+        self._busy = False
+        self._generation = 0
 
     @property
     def ready(self) -> bool:
@@ -242,27 +248,48 @@ class ProbeSession:
             self._ready = False
             self._results = []
             self._selected = []
-            # 保留 _region 无妨；ensure 时若同区也会因 _ready=False 重探
+            self._generation += 1
+            self._cond.notify_all()
 
     def ensure_probed(
         self,
         region_id: str,
         stop_event: Optional[threading.Event] = None,
     ) -> List[ProbeResult]:
-        with self._lock:
-            if self._ready and self._region == region_id:
-                return list(self._selected)
+        while True:
+            with self._cond:
+                # 已有可用结果且地区匹配 → 直接复用
+                if self._ready and self._region == region_id:
+                    return list(self._selected)
+                # 他人正在探测：等待结束后再判断（同区可复用，避免双开）
+                if self._busy:
+                    self._cond.wait(timeout=0.2)
+                    if stop_event is not None and stop_event.is_set():
+                        return list(self._selected)
+                    continue
+                if self._ready and self._region == region_id:
+                    return list(self._selected)
+                gen = self._generation
+                self._busy = True
 
-        sources = self._catalog.sources_for(region_id)
-        results = self._ping_fn(sources, stop_event=stop_event)
-        selected = pick_optimal_sources(results)
-
-        with self._lock:
-            self._region = region_id
-            self._results = list(results)
-            self._selected = list(selected)
-            self._ready = True
-            return list(self._selected)
+            try:
+                sources = self._catalog.sources_for(region_id)
+                results = self._ping_fn(sources, stop_event=stop_event)
+                selected = pick_optimal_sources(results)
+                with self._cond:
+                    # 探测期间被 invalidate：丢弃，出锁后 while 重试
+                    if gen == self._generation:
+                        self._region = region_id
+                        self._results = list(results)
+                        self._selected = list(selected)
+                        self._ready = True
+                        return list(self._selected)
+            finally:
+                with self._cond:
+                    self._busy = False
+                    self._cond.notify_all()
+            if stop_event is not None and stop_event.is_set():
+                return []
 
     def selected_urls(self) -> List[str]:
         with self._lock:
@@ -276,12 +303,13 @@ class ProbeSession:
         with self._lock:
             return list(self._results)
 
-    def summary_text(self) -> str:
+    def summary_text(self, sep: str = " ｜ ") -> str:
+        """节点延迟摘要；默认用窄分隔符，便于 UI 换行显示全。"""
         with self._lock:
             if not self._ready or not self._selected:
                 return "尚未探测"
             parts = [f"{n} {lat:.0f}ms" for n, _, lat in self._selected]
-            return " / ".join(parts)
+            return sep.join(parts)
 
 
 # ─── 设置读写 ───
