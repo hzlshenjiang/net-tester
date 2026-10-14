@@ -119,6 +119,35 @@ class TestPickOptimalSources(unittest.TestCase):
     def test_empty_returns_empty(self):
         self.assertEqual(pick_optimal_sources([]), [])
 
+    def test_prefers_host_diversity_over_same_host_pair(self):
+        # 两台华为同 host 延迟更低，仍应优先拉进不同 host，避免连接挤在一家
+        results = [
+            ("华为A", "https://mirrors.huaweicloud.com/a", 20.0),
+            ("华为B", "https://mirrors.huaweicloud.com/b", 22.0),
+            ("腾讯", "https://dldir1.qq.com/x", 35.0),
+            ("阿里", "https://mirrors.aliyun.com/x", 40.0),
+        ]
+        picked = pick_optimal_sources(results, min_n=3, max_n=4, slack_ms=80)
+        hosts = {u.split("/")[2] for _, u, _ in picked}
+        self.assertGreaterEqual(len(hosts), 3)
+        names = [n for n, _, _ in picked]
+        self.assertIn("腾讯", names)
+        self.assertIn("阿里", names)
+
+    def test_drops_multi_second_latency_when_fast_enough(self):
+        results = [
+            ("快1", "https://a.example/x", 30.0),
+            ("快2", "https://b.example/x", 40.0),
+            ("快3", "https://c.example/x", 50.0),
+            ("残", "https://d.example/x", 2081.0),
+            ("更残", "https://e.example/x", 4083.0),
+        ]
+        picked = pick_optimal_sources(results)
+        names = [n for n, _, _ in picked]
+        self.assertNotIn("残", names)
+        self.assertNotIn("更残", names)
+        self.assertGreaterEqual(len(picked), 3)
+
 
 class TestPlanDownloadConcurrency(unittest.TestCase):
     def test_two_sources_get_at_least_32_connections(self):

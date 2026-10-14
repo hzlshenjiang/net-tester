@@ -7,7 +7,7 @@
 3. 上传测速：http.client 多连接连续 POST 大包（类 cfspeed），取吞吐量
 4. 延迟：TCP 连接测延迟
 
-仪表盘显示真实累计吞吐，不做假平滑过滤。
+仪表盘显示近窗真实吞吐（非假平滑）；最终成绩仍按首末字节累计。
 """
 
 import tkinter as tk
@@ -21,6 +21,7 @@ import socket
 import math
 import http.client
 import urllib.request
+from collections import deque
 from urllib.parse import urlparse
 from queue import Empty, Queue
 
@@ -61,19 +62,33 @@ UPLOAD_DURATION = 10
 
 
 class ByteAccumulator:
-    """线程安全的字节累计器——只提供真实累计吞吐，不做假过滤"""
+    """线程安全的字节累计器。
+
+    最终成绩用首末字节累计；仪表用「近窗吞吐 + 轻度 EMA」，
+    避免累计均值那种「冲到一百多再拖十几秒慢慢掉到六十」的假掉速感。
+    """
+
+    LIVE_WINDOW_S = 2.0
+    # EMA 时间常数（秒）：只做轻度跟上，不是假平滑把成绩拧到别处
+    LIVE_EMA_TAU_S = 0.8
 
     def __init__(self):
         self._lock = threading.Lock()
         self.total = 0
         self._first_byte_t = None
         self._last_byte_t = None
+        self._samples = deque()  # (t, cumulative_total)
+        self._ema_mbps = None
+        self._ema_t = None
 
     def reset(self):
         with self._lock:
             self.total = 0
             self._first_byte_t = None
             self._last_byte_t = None
+            self._samples.clear()
+            self._ema_mbps = None
+            self._ema_t = None
 
     def add(self, n):
         if n <= 0:
@@ -84,6 +99,10 @@ class ByteAccumulator:
                 self._first_byte_t = now
             self._last_byte_t = now
             self.total += n
+            self._samples.append((now, self.total))
+            cut = now - self.LIVE_WINDOW_S - 0.5
+            while len(self._samples) > 2 and self._samples[0][0] < cut:
+                self._samples.popleft()
 
     def transfer_elapsed(self):
         """首字节→末字节"""
@@ -101,16 +120,42 @@ class ByteAccumulator:
             elapsed = max(now - self._first_byte_t, 0.001)
             return self.total / elapsed * 8 / 1_000_000
 
+    def _window_mbps_unlocked(self, now: float) -> float:
+        elapsed = now - self._first_byte_t
+        cut = now - self.LIVE_WINDOW_S
+        t0 = self._first_byte_t
+        b0 = 0
+        for t, b in self._samples:
+            if t <= cut:
+                t0, b0 = t, b
+            else:
+                break
+        dt = now - t0
+        if dt < 0.2:
+            return self.total / max(elapsed, 0.001) * 8 / 1_000_000
+        return (self.total - b0) / dt * 8 / 1_000_000
+
     def live_mbps(self):
-        """给仪表盘的真实读数：样本不足时先为 0，够了就报累计吞吐"""
+        """仪表读数：近窗真实吞吐再轻度 EMA。"""
         with self._lock:
             if self._first_byte_t is None or self.total <= 0:
                 return 0.0
-            elapsed = time.time() - self._first_byte_t
-        # 不足 0.25s 样本太少，不算“造假”，只是还没形成有效成绩
-        if elapsed < 0.25:
-            return 0.0
-        return self.average_mbps()
+            now = time.time()
+            elapsed = now - self._first_byte_t
+            if elapsed < 0.35:
+                return 0.0
+            instant = self._window_mbps_unlocked(now)
+            if self._ema_mbps is None:
+                self._ema_mbps = instant
+                self._ema_t = now
+                return instant
+            dt = max(now - (self._ema_t or now), 0.0)
+            self._ema_t = now
+            # alpha = 1 - e^(-dt/tau)：跟上真实变化，但不跟每个突发毛刺死磕
+            alpha = 1.0 - math.exp(-dt / self.LIVE_EMA_TAU_S) if dt > 0 else 1.0
+            alpha = min(max(alpha, 0.0), 1.0)
+            self._ema_mbps = self._ema_mbps * (1.0 - alpha) + instant * alpha
+            return self._ema_mbps
 
 
 def measure_ping(host, port=443, count=5, timeout=5):
@@ -356,6 +401,9 @@ def measure_upload_timed(url, duration=UPLOAD_DURATION, threads=8,
         )
         workers.append(t)
         t.start()
+        # 错开建连，减轻「开局八条一起冲」造成的仪表虚高
+        if i + 1 < threads:
+            time.sleep(0.08)
 
     while time.time() < t_end:
         if stop_event is not None and stop_event.is_set():
@@ -1213,6 +1261,12 @@ class SpeedTestApp:
             self._update_realtime(f"节点延迟：{node_info}")
             self._ui(lambda: self.sources_var.set(f"测速源：{node_info}"))
             results["nodes"] = node_info
+            # 秒级延迟时下载会被建连吃掉大半窗口，成绩会明显偏低——直接说清楚
+            best_lat = min((lat for _, _, lat in selected), default=0.0)
+            if best_lat >= 800:
+                self._update_realtime(
+                    f"节点延迟偏高（最优 {best_lat:.0f}ms），下载可能严重偏低，建议换区或点「重新探测」"
+                )
             self._update_progress(15)
 
             # 下载阶段：只用择优源

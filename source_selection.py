@@ -90,6 +90,10 @@ class RegionCatalog:
         return list(cls._POOLS.keys())
 
 
+def _source_host(url: str) -> str:
+    return (urlparse(url).hostname or url).lower()
+
+
 def pick_optimal_sources(
     results: Sequence[ProbeResult],
     min_n: int = 3,
@@ -98,7 +102,10 @@ def pick_optimal_sources(
 ) -> List[ProbeResult]:
     """延迟落在「最优 + slack」内的源；至少 min_n、最多 max_n。
 
-    默认 Top3～4 + 较宽余裕：多源并行才能打满家宽（2 源×8 连接易卡在 ~200Mbps）。
+    默认 Top3～4 + 较宽余裕：多源并行才能打满家宽。
+    额外约束：
+    - 有足够「快源」时丢掉 >1000ms 的半残节点（避免 2～4s 假延迟拖死下载）
+    - 按主机名分散：优先每主机 1 条，同主机最多 2 条（防双华为挤占连接）
     """
     reachable = [
         (n, u, lat) for n, u, lat in results
@@ -108,16 +115,55 @@ def pick_optimal_sources(
         return []
 
     reachable.sort(key=lambda x: x[2])
+
+    # 软过滤：过滤后仍够 min_n 才丢高延迟，避免「全网都慢」时选不够源
+    fast = [r for r in reachable if r[2] <= 500.0]
+    if len(fast) >= min_n:
+        reachable = fast
+    else:
+        usable = [r for r in reachable if r[2] <= 1000.0]
+        if len(usable) >= min_n:
+            reachable = usable
+
     best = reachable[0][2]
     within = [r for r in reachable if r[2] <= best + slack_ms]
+    pool = within if len(within) >= min_n else reachable
+    need = min(max_n, max(min_n, len(within) if len(within) >= min_n else min(min_n, len(pool))))
+    need = min(need, len(pool), max_n)
 
-    if len(within) >= min_n:
-        return within[:max_n]
+    picked: List[ProbeResult] = []
+    host_count: dict = {}
 
-    # 不足 min_n：按延迟从全量可达列表补到 min_n（不超过 max_n）
-    need = min(len(reachable), max(min_n, len(within)))
-    need = min(need, max_n)
-    return reachable[:need]
+    def _try_add(row: ProbeResult, limit: int) -> bool:
+        h = _source_host(row[1])
+        if host_count.get(h, 0) >= limit:
+            return False
+        picked.append(row)
+        host_count[h] = host_count.get(h, 0) + 1
+        return True
+
+    # 第一轮：每主机最多 1
+    for row in pool:
+        if len(picked) >= need:
+            break
+        _try_add(row, 1)
+    # 第二轮：仍不足则同主机最多再补到 2
+    if len(picked) < need:
+        for row in pool:
+            if len(picked) >= need:
+                break
+            if row in picked:
+                continue
+            _try_add(row, 2)
+    # 仍不足（极端：源太少）：忽略主机限制补齐
+    if len(picked) < need:
+        for row in pool:
+            if len(picked) >= need:
+                break
+            if row not in picked:
+                picked.append(row)
+
+    return picked
 
 
 def plan_download_concurrency(
