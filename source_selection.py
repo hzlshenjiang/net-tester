@@ -72,11 +72,14 @@ class RegionCatalog:
 
 def pick_optimal_sources(
     results: Sequence[ProbeResult],
-    min_n: int = 2,
+    min_n: int = 3,
     max_n: int = 4,
-    slack_ms: float = 25.0,
+    slack_ms: float = 80.0,
 ) -> List[ProbeResult]:
-    """延迟落在「最优 + slack」内的源；至少 min_n、最多 max_n。"""
+    """延迟落在「最优 + slack」内的源；至少 min_n、最多 max_n。
+
+    默认 Top3～4 + 较宽余裕：多源并行才能打满家宽（2 源×8 连接易卡在 ~200Mbps）。
+    """
     reachable = [
         (n, u, lat) for n, u, lat in results
         if lat < UNREACHABLE_MS and lat > 0
@@ -95,6 +98,34 @@ def pick_optimal_sources(
     need = min(len(reachable), max(min_n, len(within)))
     need = min(need, max_n)
     return reachable[:need]
+
+
+def plan_download_concurrency(
+    num_urls: int,
+    high_bandwidth: bool = False,
+) -> Tuple[int, int]:
+    """按源数量规划下载连接数，返回 (每源线程数, 总连接数)。
+
+    目标：常态总连接 ≥32；高带宽加连 ≥40。源越少，每源线程越高。
+    """
+    if num_urls <= 0:
+        return 0, 0
+    target = 40 if high_bandwidth else 32
+    if num_urls == 1:
+        tpu = 20 if high_bandwidth else 16
+    elif num_urls == 2:
+        tpu = 20 if high_bandwidth else 16
+    elif num_urls == 3:
+        tpu = 14 if high_bandwidth else 12
+    else:
+        # 4 源及以上：均摊到目标，并设下限
+        tpu = max(8, (target + num_urls - 1) // num_urls)
+        if high_bandwidth:
+            tpu = max(tpu, 10)
+    while tpu * num_urls < target:
+        tpu += 1
+    tpu = min(tpu, 24)
+    return tpu, tpu * num_urls
 
 
 def resolve_region(settings: dict, locate_fn: Optional[Callable[[], Optional[str]]] = None) -> str:

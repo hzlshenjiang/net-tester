@@ -2,8 +2,8 @@
 """网络测速工具 - 绿色版
 
 测速方案（参考 speedtest-cli / cfspeed 思路，针对国内优化）：
-1. 地区源池 + 启动并行 TCP 探测，会话复用，动态择优 2～4 源
-2. 下载测速：多线程持续下载 10 秒，取总吞吐量
+1. 地区源池 + 启动并行 TCP 探测，会话复用，动态择优 Top3～4 源
+2. 下载测速：多源多连接（总连接≥32）持续下载 10 秒，取总吞吐量
 3. 上传测速：http.client 多连接连续 POST 大包（类 cfspeed），取吞吐量
 4. 延迟：TCP 连接测延迟
 
@@ -31,6 +31,7 @@ from source_selection import (
     RegionCatalog,
     load_settings,
     locate_region_by_ip,
+    plan_download_concurrency,
     resolve_region,
     save_settings,
 )
@@ -165,15 +166,19 @@ class TimedDownloader(threading.Thread):
         self.result_queue.put((self.thread_id, total_bytes, elapsed))
 
 
-def measure_download_timed(urls, duration=DOWNLOAD_DURATION, threads_per_url=8,
-                           callback=None, progress_callback=None, stop_event=None):
+def measure_download_timed(urls, duration=DOWNLOAD_DURATION, threads_per_url=None,
+                           callback=None, progress_callback=None, stop_event=None,
+                           high_bandwidth=False):
     """多 URL 多线程持续下载，返回 (总字节, 速度Mbps)"""
     if isinstance(urls, str):
         urls = [urls]
 
-    if len(urls) == 1:
-        threads_per_url = 12
-    total_threads = len(urls) * threads_per_url
+    if threads_per_url is None:
+        threads_per_url, total_threads = plan_download_concurrency(
+            len(urls), high_bandwidth=high_bandwidth,
+        )
+    else:
+        total_threads = len(urls) * threads_per_url
 
     acc = ByteAccumulator()
     acc.reset()
@@ -1045,8 +1050,9 @@ class SpeedTestApp:
             self._gauge_speed(0, "下载")
 
             urls = [u for _, u, _ in selected]
+            # 连接数由 plan_download_concurrency 决定（目标 ≥32）
             total_bytes, dl_speed = measure_download_timed(
-                urls, duration=DOWNLOAD_DURATION, threads_per_url=8,
+                urls, duration=DOWNLOAD_DURATION,
                 callback=None,
                 progress_callback=lambda mbps: self._gauge_speed(mbps, "下载"),
                 stop_event=self.stop_event,

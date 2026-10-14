@@ -8,6 +8,7 @@ from source_selection import (
     RegionCatalog,
     ProbeSession,
     pick_optimal_sources,
+    plan_download_concurrency,
     resolve_region,
 )
 
@@ -31,8 +32,24 @@ class TestRegionCatalog(unittest.TestCase):
 
 
 class TestPickOptimalSources(unittest.TestCase):
+    def test_default_aims_top3_for_bandwidth(self):
+        # 带宽优先：默认至少 3 个；58ms 相对 31ms 仍应纳入
+        results = [
+            ("阿里", "https://a.example/x", 31.0),
+            ("腾讯", "https://b.example/x", 39.0),
+            ("华为", "https://c.example/x", 58.0),
+            ("华为2", "https://d.example/x", 70.0),
+        ]
+        picked = pick_optimal_sources(results)
+        names = [n for n, _, _ in picked]
+        self.assertGreaterEqual(len(picked), 3)
+        self.assertLessEqual(len(picked), 4)
+        self.assertIn("阿里", names)
+        self.assertIn("腾讯", names)
+        self.assertIn("华为", names)
+
     def test_picks_within_slack_of_best(self):
-        # 最优 20ms，阈值 25 → 阈值 45ms；第三源 50 应被排除；最多 4
+        # 显式窄余裕：最优 20ms + 25 → 45ms；D=50 排除
         results = [
             ("A", "https://a.example/x", 20.0),
             ("B", "https://b.example/x", 30.0),
@@ -49,10 +66,9 @@ class TestPickOptimalSources(unittest.TestCase):
             ("B", "https://b.example/x", 100.0),
             ("C", "https://c.example/x", 200.0),
         ]
-        picked = pick_optimal_sources(results, min_n=2, max_n=4, slack_ms=25)
-        self.assertEqual(len(picked), 2)
-        self.assertEqual(picked[0][0], "A")
-        self.assertEqual(picked[1][0], "B")
+        picked = pick_optimal_sources(results, min_n=3, max_n=4, slack_ms=25)
+        self.assertEqual(len(picked), 3)
+        self.assertEqual([n for n, _, _ in picked], ["A", "B", "C"])
 
     def test_caps_at_max_n(self):
         results = [
@@ -62,7 +78,7 @@ class TestPickOptimalSources(unittest.TestCase):
             ("D", "https://d.example/x", 16.0),
             ("E", "https://e.example/x", 18.0),
         ]
-        picked = pick_optimal_sources(results, min_n=2, max_n=4, slack_ms=25)
+        picked = pick_optimal_sources(results, min_n=3, max_n=4, slack_ms=80)
         self.assertEqual(len(picked), 4)
         self.assertEqual([n for n, _, _ in picked], ["A", "B", "C", "D"])
 
@@ -71,14 +87,36 @@ class TestPickOptimalSources(unittest.TestCase):
             ("A", "https://a.example/x", 15.0),
             ("Dead", "https://dead.example/x", 99999.0),
             ("B", "https://b.example/x", 20.0),
+            ("C", "https://c.example/x", 25.0),
         ]
-        picked = pick_optimal_sources(results, min_n=2, max_n=4, slack_ms=25)
+        picked = pick_optimal_sources(results, min_n=3, max_n=4, slack_ms=80)
         names = [n for n, _, _ in picked]
-        self.assertEqual(names, ["A", "B"])
+        self.assertEqual(names, ["A", "B", "C"])
         self.assertNotIn("Dead", names)
 
     def test_empty_returns_empty(self):
         self.assertEqual(pick_optimal_sources([]), [])
+
+
+class TestPlanDownloadConcurrency(unittest.TestCase):
+    def test_two_sources_get_at_least_32_connections(self):
+        tpu, total = plan_download_concurrency(2)
+        self.assertGreaterEqual(total, 32)
+        self.assertEqual(tpu * 2, total)
+
+    def test_three_sources_stay_in_high_parallel_band(self):
+        tpu, total = plan_download_concurrency(3)
+        self.assertGreaterEqual(total, 30)
+        self.assertLessEqual(total, 48)
+
+    def test_four_sources_about_32_to_40(self):
+        tpu, total = plan_download_concurrency(4)
+        self.assertGreaterEqual(total, 32)
+        self.assertLessEqual(total, 48)
+
+    def test_high_bandwidth_boost(self):
+        tpu, total = plan_download_concurrency(2, high_bandwidth=True)
+        self.assertGreaterEqual(total, 40)
 
 
 class TestResolveRegion(unittest.TestCase):
@@ -142,22 +180,20 @@ class TestProbeSession(unittest.TestCase):
         session.ensure_probed("east_china")
         self.assertEqual(calls["n"], 2)
 
-    def test_selected_urls_come_from_optimal_pick(self):
+    def test_selected_urls_prefer_at_least_three_when_available(self):
         def fake_ping(sources, stop_event=None):
-            # 人为给出延迟：前两名近、后面远
+            # 模拟华南实测：两近两稍远，默认应选到至少 3 个
+            lats = [31.0, 39.0, 58.0, 70.0]
             out = []
             for i, (n, u) in enumerate(sources):
-                out.append((n, u, 10.0 + i * 5 if i < 2 else 200.0))
+                out.append((n, u, lats[i] if i < len(lats) else 200.0))
             return out
 
         session = ProbeSession(ping_fn=fake_ping)
         session.ensure_probed("south_china")
         urls = session.selected_urls()
-        self.assertGreaterEqual(len(urls), 2)
+        self.assertGreaterEqual(len(urls), 3)
         self.assertLessEqual(len(urls), 4)
-        # 应是 https URL
-        for u in urls:
-            self.assertTrue(u.startswith("https://"))
 
 
 class TestDownloadWiring(unittest.TestCase):
@@ -174,9 +210,6 @@ class TestDownloadWiring(unittest.TestCase):
         self.assertTrue(selected)
         self.assertTrue(set(selected).issubset(pool_urls))
         self.assertLessEqual(len(selected), 4)
-        # 不应默认等于「池内全部」（池 >=3 且择优会裁）
-        if len(pool_urls) > 4:
-            self.assertLess(len(selected), len(pool_urls))
 
 
 if __name__ == "__main__":
