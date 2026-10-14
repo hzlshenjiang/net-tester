@@ -142,9 +142,17 @@ class TimedDownloader(threading.Thread):
         self.accumulator = accumulator
         self.stop_event = stop_event
         self._should_stop = False
+        self._resp = None
 
     def stop(self):
         self._should_stop = True
+        # 立刻掐断连接，避免 join 超时后线程仍在读、拖累上传/卡 UI
+        resp = self._resp
+        if resp is not None:
+            try:
+                resp.close()
+            except Exception:
+                pass
 
     def _stopped(self):
         return self._should_stop or (self.stop_event is not None and self.stop_event.is_set())
@@ -155,13 +163,17 @@ class TimedDownloader(threading.Thread):
         try:
             req = urllib.request.Request(self.url, headers={"User-Agent": "Mozilla/5.0"})
             with urllib.request.urlopen(req, timeout=self.duration + 5, context=_ctx) as resp:
-                while not self._stopped() and (time.time() - start) < self.duration:
-                    chunk = resp.read(131072)  # 128KB
-                    if not chunk:
-                        break
-                    total_bytes += len(chunk)
-                    if self.accumulator:
-                        self.accumulator.add(len(chunk))
+                self._resp = resp
+                try:
+                    while not self._stopped() and (time.time() - start) < self.duration:
+                        chunk = resp.read(131072)  # 128KB
+                        if not chunk:
+                            break
+                        total_bytes += len(chunk)
+                        if self.accumulator:
+                            self.accumulator.add(len(chunk))
+                finally:
+                    self._resp = None
         except Exception:
             pass
         elapsed = time.time() - start
@@ -209,7 +221,7 @@ def measure_download_timed(urls, duration=DOWNLOAD_DURATION, threads_per_url=Non
 
     for t in workers:
         t.stop()
-    join_deadline = time.time() + 2
+    join_deadline = time.time() + 3
     for t in workers:
         t.join(timeout=max(join_deadline - time.time(), 0.05))
 
@@ -462,8 +474,12 @@ class SpeedGauge:
         self._draw_static()
         self._draw_dynamic(0.0)
 
-    def set_speed(self, mbps, mode=None):
-        """设置真实速度；数字直接显示该值"""
+    def set_speed(self, mbps, mode=None, snap=False):
+        """设置真实速度；数字直接显示该值。
+
+        snap=True：换阶段时瞬间归零/就位，避免上传阶段还从下载峰值慢慢掉下来。
+        """
+        mode_changed = mode is not None and mode != self.mode
         if mode is not None:
             self.mode = mode
         mbps = max(0.0, float(mbps))
@@ -472,6 +488,17 @@ class SpeedGauge:
             self.max_mbps = float(need)
             self._draw_static()
         self.target = mbps
+        if snap or mode_changed:
+            # 阶段切换：取消旧动画，指针与数字立刻跟上
+            if self._anim_job:
+                try:
+                    self.canvas.after_cancel(self._anim_job)
+                except Exception:
+                    pass
+                self._anim_job = None
+            self.current = mbps
+            self._draw_dynamic(self.current, self.target)
+            return
         # 数字用真实值；指针快速追上（不做慢爬阻尼）
         if self._anim_job is None:
             self._tick()
@@ -697,6 +724,10 @@ class SpeedTestApp:
         self._probing = False
         self._probe_pending = None
         self._ui_queue = Queue()
+        # 仪表更新合并：避免下载 10s×10Hz 灌爆队列导致卡顿，以及上传阶段仍刷到旧下载值
+        self._gauge_gen = 0
+        self._gauge_pending = None  # (gen, mbps, mode, snap)
+        self._gauge_flush_queued = False
 
         self._build_ui()
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -954,8 +985,41 @@ class SpeedTestApp:
         except Exception:
             pass
 
-    def _gauge_speed(self, mbps, mode):
-        self._ui(lambda m=mbps, md=mode: self.gauge.set_speed(m, md))
+    def _gauge_speed(self, mbps, mode, snap=False, expect_gen=None):
+        """线程安全更新仪表；同阶段只保留最新一帧，换阶段可 snap 归零。
+
+        expect_gen：进度回调传入开测时的代际；若阶段已切换则直接丢弃，
+        避免「检查通过后、写入前」被 snap 插队，把下载峰值刷进上传阶段。
+        """
+        if snap:
+            self._gauge_gen += 1
+        gen = self._gauge_gen
+        if expect_gen is not None and expect_gen != gen:
+            return
+        self._gauge_pending = (gen, float(mbps), mode, bool(snap))
+        # 队列里只挂一次 flush，后续进度只改 pending，减轻下载尾段卡顿
+        if not self._gauge_flush_queued:
+            self._gauge_flush_queued = True
+            self._ui(self._flush_gauge)
+
+    def _flush_gauge(self):
+        pending = self._gauge_pending
+        if pending is None:
+            self._gauge_flush_queued = False
+            return
+        gen, mbps, mode, snap = pending
+        if gen != self._gauge_gen:
+            self._gauge_flush_queued = False
+            return
+        try:
+            self.gauge.set_speed(mbps, mode, snap=snap)
+        except Exception:
+            pass
+        # 绘制期间若又有新进度，补排一次；否则放开标志
+        if self._gauge_pending is not pending:
+            self._ui(self._flush_gauge)
+        else:
+            self._gauge_flush_queued = False
 
     def _stopped(self):
         return self.stop_event.is_set() or self._closing
@@ -1128,14 +1192,14 @@ class SpeedTestApp:
         try:
             self._update_status("正在确认测速节点")
             self._update_progress(5)
-            self._gauge_speed(0, "探测")
+            self._gauge_speed(0, "探测", snap=True)
 
             if not self._wait_probe_ready():
                 if self._stopped():
                     stopped = True
                     return
                 self._update_status("所有节点不可达，请检查网络")
-                self._gauge_speed(0, "")
+                self._gauge_speed(0, "", snap=True)
                 return
 
             if self._stopped():
@@ -1154,7 +1218,8 @@ class SpeedTestApp:
             # 下载阶段：只用择优源
             self._update_status(f"正在测试下载速度（{DOWNLOAD_DURATION}秒）")
             self._start_dots("download", "下载速度：测试中")
-            self._gauge_speed(0, "下载")
+            self._gauge_speed(0, "下载", snap=True)
+            dl_gen = self._gauge_gen
 
             urls = [u for _, u, _ in selected]
             # 防呆：摸底未结束不开正式下载（叠流会出现下载/上传 0 Mbps）
@@ -1165,7 +1230,9 @@ class SpeedTestApp:
             total_bytes, dl_speed = measure_download_timed(
                 urls, duration=DOWNLOAD_DURATION,
                 callback=lambda msg: self._update_realtime(msg),
-                progress_callback=lambda mbps: self._gauge_speed(mbps, "下载"),
+                progress_callback=lambda mbps, g=dl_gen: self._gauge_speed(
+                    mbps, "下载", expect_gen=g,
+                ),
                 stop_event=self.stop_event,
                 high_bandwidth=high_bw,
             )
@@ -1174,11 +1241,14 @@ class SpeedTestApp:
             if not self._stopped() and dl_speed < 1.0 and urls:
                 self._update_realtime("下载接近 0，0.5s 后重试…")
                 time.sleep(0.5)
-                self._gauge_speed(0, "下载")
+                self._gauge_speed(0, "下载", snap=True)
+                dl_gen = self._gauge_gen
                 total_bytes, dl_speed = measure_download_timed(
                     urls, duration=DOWNLOAD_DURATION,
                     callback=lambda msg: self._update_realtime(msg),
-                    progress_callback=lambda mbps: self._gauge_speed(mbps, "下载"),
+                    progress_callback=lambda mbps, g=dl_gen: self._gauge_speed(
+                        mbps, "下载", expect_gen=g,
+                    ),
                     stop_event=self.stop_event,
                     high_bandwidth=high_bw,
                 )
@@ -1194,22 +1264,25 @@ class SpeedTestApp:
             self._stop_dots("download")
             results["download"] = dl_speed
             self._set_status_text("download", f"下载速度：{dl_speed:.2f} Mbps")
-            self._gauge_speed(dl_speed, "下载")
+            self._gauge_speed(dl_speed, "下载", snap=True)
             self._update_progress(60)
 
-            # 上传阶段：避开残留摸底；下载大并发后稍歇，降低上传被打成 0 的概率
+            # 上传阶段：掐断下载残留 + 丢掉队列里旧的下载仪表帧 + 指针瞬间归零
             if self.probe_session.sampling:
                 self.probe_session.wait_for_sample(5.0, stop_event=self.stop_event)
             if not self._stopped():
                 time.sleep(0.5)
             self._update_status(f"正在测试上传速度（{UPLOAD_DURATION}秒）")
             self._start_dots("upload", "上传速度：测试中")
-            self._gauge_speed(0, "上传")
+            self._gauge_speed(0, "上传", snap=True)
+            ul_gen = self._gauge_gen
 
             total_up, ul_speed = measure_upload_timed(
                 UPLOAD_URL, duration=UPLOAD_DURATION, threads=8,
                 callback=None,
-                progress_callback=lambda mbps: self._gauge_speed(mbps, "上传"),
+                progress_callback=lambda mbps, g=ul_gen: self._gauge_speed(
+                    mbps, "上传", expect_gen=g,
+                ),
                 stop_event=self.stop_event,
             )
 
@@ -1217,11 +1290,14 @@ class SpeedTestApp:
             if not self._stopped() and ul_speed < 10:
                 self._update_realtime(f"上传 {ul_speed:.0f} Mbps 偏低，0.5s 后 12 线程重试...")
                 time.sleep(0.5)
-                self._gauge_speed(0, "上传")
+                self._gauge_speed(0, "上传", snap=True)
+                ul_gen = self._gauge_gen
                 total_up, ul_speed = measure_upload_timed(
                     UPLOAD_URL, duration=UPLOAD_DURATION, threads=12,
                     callback=None,
-                    progress_callback=lambda mbps: self._gauge_speed(mbps, "上传"),
+                    progress_callback=lambda mbps, g=ul_gen: self._gauge_speed(
+                        mbps, "上传", expect_gen=g,
+                    ),
                     stop_event=self.stop_event,
                 )
 
@@ -1236,7 +1312,7 @@ class SpeedTestApp:
             self._stop_dots("upload")
             results["upload"] = ul_speed
             self._set_status_text("upload", f"上传速度：{ul_speed:.2f} Mbps")
-            self._gauge_speed(ul_speed, "上传")
+            self._gauge_speed(ul_speed, "上传", snap=True)
             self._update_realtime(
                 f"上传完成: {total_up/1_000_000:.1f}MB / {UPLOAD_DURATION}s = {ul_speed:.2f} Mbps"
             )
@@ -1323,9 +1399,12 @@ class SpeedTestApp:
     def _poll_ui(self):
         if self._closing:
             return
+        # 每拍最多处理一批，避免下载尾段队列堆积时主线程卡死
+        budget = 40
         try:
-            while True:
+            while budget > 0:
                 fn = self._ui_queue.get_nowait()
+                budget -= 1
                 try:
                     fn()
                 except Exception:
