@@ -2,8 +2,8 @@
 """网络测速工具 - 绿色版
 
 测速方案（参考 speedtest-cli / cfspeed 思路，针对国内优化）：
-1. 地区源池 + 启动并行 TCP 探测，会话复用，动态择优 Top3～4 源
-2. 下载测速：多源多连接（总连接≥32）持续下载 10 秒，取总吞吐量
+1. 地区源池 + 延迟够用即继续（静默补探）+ 轻量摸底定档（≥300Mbps→高带宽）
+2. 下载测速：多源多连接（常态≥32，高带宽≥40）持续下载 10 秒，取总吞吐量
 3. 上传测速：http.client 多连接连续 POST 大包（类 cfspeed），取吞吐量
 4. 延迟：TCP 连接测延迟
 
@@ -27,11 +27,13 @@ from queue import Empty, Queue
 from source_selection import (
     DEFAULT_REGION,
     REGION_LABELS,
+    SAMPLE_DURATION_S,
     ProbeSession,
     RegionCatalog,
     load_settings,
     locate_region_by_ip,
     plan_download_concurrency,
+    plan_sample_concurrency,
     resolve_region,
     save_settings,
 )
@@ -686,7 +688,11 @@ class SpeedTestApp:
         self._workers_lock = threading.Lock()
 
         self.settings = load_settings()
-        self.probe_session = ProbeSession()
+        # 探测内轻量摸底 → high_bandwidth；必须接到正式下载
+        self.probe_session = ProbeSession(
+            sample_fn=self._bandwidth_sample,
+            on_update=self._on_probe_session_updated,
+        )
         self._probe_lock = threading.Lock()
         self._probing = False
         self._probe_pending = None
@@ -826,6 +832,40 @@ class SpeedTestApp:
         else:
             self.start_test()
 
+    def _bandwidth_sample(self, urls, stop_event=None):
+        """探测会话注入的轻量摸底：约 2 秒、总连接约 8～12，不进最终成绩。"""
+        if not urls:
+            return 0.0
+        tpu, _ = plan_sample_concurrency(len(urls))
+        _, mbps = measure_download_timed(
+            urls,
+            duration=SAMPLE_DURATION_S,
+            threads_per_url=tpu,
+            stop_event=stop_event,
+        )
+        return float(mbps)
+
+    def _on_probe_session_updated(self):
+        """静默补探更新择优后刷新文案（测速中不改）。"""
+        if self._closing or self.is_testing:
+            return
+        summary = self.probe_session.summary_text()
+        hb = self.probe_session.high_bandwidth
+        urls = self.probe_session.selected_urls()
+
+        def _apply():
+            if self._closing or self.is_testing:
+                return
+            if urls:
+                self.sources_var.set(f"测速源：{summary}")
+                extra = "（高带宽档）" if hb else ""
+                if not self._probing:
+                    self.status_var.set(f"就绪 — 点击开始测速{extra}")
+            else:
+                self.sources_var.set("测速源：无可用节点")
+
+        self._ui(_apply)
+
     def start_test(self):
         if self.is_testing:
             return
@@ -834,6 +874,7 @@ class SpeedTestApp:
         self.btn_start.config(state="normal", text="停止测试")
         # 测速中禁止换区 / 重探 / 自动定位，避免踩坏会话缓存
         self._set_region_controls_enabled(False)
+        self.probe_session.set_silent_updates(False)
         self.progress["value"] = 0
         self.realtime_var.set("")
         self._set_report("")
@@ -1021,16 +1062,20 @@ class SpeedTestApp:
                 if not self.is_testing:
                     self._ui(lambda lab=label: self.region_var.set(lab))
 
+                if not self.is_testing:
+                    self._ui(lambda: self.status_var.set("正在探测节点…"))
                 selected = self.probe_session.ensure_probed(region)
                 summary = self.probe_session.summary_text()
+                hb = self.probe_session.high_bandwidth
 
-                def _done(sel=selected, summ=summary):
+                def _done(sel=selected, summ=summary, high_bw=hb):
                     if self._closing:
                         return
                     if sel:
                         self.sources_var.set(f"测速源：{summ}")
                         if not self.is_testing:
-                            self.status_var.set("就绪 — 点击开始测速")
+                            extra = "（高带宽档）" if high_bw else ""
+                            self.status_var.set(f"就绪 — 点击开始测速{extra}")
                     else:
                         self.sources_var.set("测速源：无可用节点")
                         if not self.is_testing:
@@ -1049,13 +1094,20 @@ class SpeedTestApp:
                 self._probing = False
 
     def _wait_probe_ready(self, timeout: float = 8.0) -> bool:
-        """开测前确保会话已探测；必要时等待后台探测或同步补探。"""
-        if self.probe_session.ready and self.probe_session.selected_urls():
-            if self.probe_session.region == getattr(self, "_test_region_id", None):
-                return True
+        """开测前确保会话已探测+摸底；必要时补探，摸底最多再等约 1 秒。"""
         region = getattr(self, "_test_region_id", None) or DEFAULT_REGION
-        # ensure_probed 会与后台预热串行：未探测完点开始 → 等同一轮结果，不双开
-        self.probe_session.ensure_probed(region, stop_event=self.stop_event)
+        need = not (
+            self.probe_session.ready
+            and self.probe_session.selected_urls()
+            and self.probe_session.region == region
+            and self.probe_session.sample_done
+        )
+        if need:
+            # ensure_probed 与后台预热串行；含轻量摸底
+            self._update_status("正在探测节点并摸底带宽…")
+            self.probe_session.ensure_probed(region, stop_event=self.stop_event)
+        # 摸底尚未完成时最多再等 1 秒，超时则按当前 high_bandwidth（多为 False）开测
+        self.probe_session.wait_for_sample(1.0, stop_event=self.stop_event)
         return bool(self.probe_session.selected_urls())
 
     def _run_test(self):
@@ -1091,12 +1143,14 @@ class SpeedTestApp:
             self._gauge_speed(0, "下载")
 
             urls = [u for _, u, _ in selected]
-            # 连接数由 plan_download_concurrency 决定（目标 ≥32）
+            # 接线硬约束：会话摸底 high_bandwidth 必须进入正式下载规划
+            high_bw = bool(self.probe_session.high_bandwidth)
             total_bytes, dl_speed = measure_download_timed(
                 urls, duration=DOWNLOAD_DURATION,
-                callback=None,
+                callback=lambda msg: self._update_realtime(msg),
                 progress_callback=lambda mbps: self._gauge_speed(mbps, "下载"),
                 stop_event=self.stop_event,
+                high_bandwidth=high_bw,
             )
 
             if self._stopped():
@@ -1171,6 +1225,7 @@ class SpeedTestApp:
                 self._finalize_stopped_status(results)
                 self._update_status("测试已停止")
             self.is_testing = False
+            self.probe_session.set_silent_updates(True)
             # 按钮复位交给主线程轮询（_schedule_idle_button）
             self._ui(self._schedule_idle_button)
 

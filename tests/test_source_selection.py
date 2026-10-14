@@ -5,10 +5,14 @@ import unittest
 
 from source_selection import (
     DEFAULT_REGION,
+    HIGH_BW_SAMPLE_MBPS,
     RegionCatalog,
     ProbeSession,
+    download_plan_for_session,
+    parallel_probe,
     pick_optimal_sources,
     plan_download_concurrency,
+    plan_sample_concurrency,
     resolve_region,
 )
 
@@ -20,6 +24,24 @@ class TestRegionCatalog(unittest.TestCase):
         for name, url in sources:
             self.assertTrue(name)
             self.assertTrue(url.startswith("https://"))
+
+    def test_south_pool_size_and_host_diversity(self):
+        from urllib.parse import urlparse
+
+        sources = RegionCatalog.sources_for("south_china")
+        self.assertGreaterEqual(len(sources), 6)
+        self.assertLessEqual(len(sources), 7)
+        hosts = {urlparse(u).hostname for _, u in sources}
+        self.assertGreaterEqual(len(hosts), 5)
+
+    def test_east_pool_size_and_host_diversity(self):
+        from urllib.parse import urlparse
+
+        sources = RegionCatalog.sources_for("east_china")
+        self.assertGreaterEqual(len(sources), 5)
+        self.assertLessEqual(len(sources), 6)
+        hosts = {urlparse(u).hostname for _, u in sources}
+        self.assertGreaterEqual(len(hosts), 4)
 
     def test_unknown_region_falls_back_to_south_china(self):
         fallback = RegionCatalog.sources_for("no_such_region")
@@ -292,6 +314,175 @@ class TestProbeSessionConcurrency(unittest.TestCase):
         self.assertIn("3087ms", text)
         self.assertIn("1551ms", text)
         self.assertIn("华为云-Python", text)
+
+
+class TestProgressiveProbe(unittest.TestCase):
+    def test_early_return_without_waiting_slowest(self):
+        import time
+
+        def ping_one(url: str) -> float:
+            if "slow" in url:
+                time.sleep(1.2)
+                return 40.0
+            time.sleep(0.02)
+            return 20.0
+
+        sources = [
+            ("A", "https://a.example/x"),
+            ("B", "https://b.example/x"),
+            ("C", "https://c.example/x"),
+            ("Slow", "https://slow.example/x"),
+        ]
+        t0 = time.time()
+        partial = parallel_probe(
+            sources, ping_one=ping_one, min_reachable=3, early_wait_s=2.5,
+            on_complete=lambda _full: None,
+        )
+        elapsed = time.time() - t0
+        self.assertLess(elapsed, 0.8)
+        self.assertGreaterEqual(
+            sum(1 for *_, lat in partial if lat < 99999), 3,
+        )
+
+    def test_on_complete_merges_remaining(self):
+        import threading
+        import time
+
+        done = threading.Event()
+        box = {"full": None}
+
+        def ping_one(url: str) -> float:
+            if "slow" in url:
+                time.sleep(0.35)
+                return 15.0
+            return 25.0
+
+        sources = [
+            ("A", "https://a.example/x"),
+            ("B", "https://b.example/x"),
+            ("C", "https://c.example/x"),
+            ("Slow", "https://slow.example/x"),
+        ]
+
+        def on_complete(full):
+            box["full"] = full
+            done.set()
+
+        parallel_probe(
+            sources, ping_one=ping_one, min_reachable=3, early_wait_s=2.5,
+            on_complete=on_complete,
+        )
+        self.assertTrue(done.wait(timeout=3))
+        names = {n for n, _, _ in box["full"]}
+        self.assertIn("Slow", names)
+
+
+class TestBandwidthSample(unittest.TestCase):
+    def test_sample_above_threshold_sets_high_bandwidth(self):
+        samples = {"n": 0}
+
+        def ping(sources, stop_event=None):
+            return [(n, u, 10.0 + i) for i, (n, u) in enumerate(sources)]
+
+        def sample(urls, stop_event=None):
+            samples["n"] += 1
+            return HIGH_BW_SAMPLE_MBPS + 20
+
+        session = ProbeSession(ping_fn=ping, sample_fn=sample)
+        session.ensure_probed("south_china")
+        self.assertTrue(session.sample_done)
+        self.assertTrue(session.sample_ok)
+        self.assertTrue(session.high_bandwidth)
+        self.assertEqual(samples["n"], 1)
+
+    def test_sample_below_threshold_stays_normal(self):
+        def ping(sources, stop_event=None):
+            return [(n, u, 10.0 + i) for i, (n, u) in enumerate(sources)]
+
+        session = ProbeSession(
+            ping_fn=ping, sample_fn=lambda urls, stop_event=None: 180.0,
+        )
+        session.ensure_probed("south_china")
+        self.assertTrue(session.sample_ok)
+        self.assertFalse(session.high_bandwidth)
+
+    def test_silent_update_keeps_high_bandwidth_without_resample(self):
+        samples = {"n": 0}
+
+        def ping(sources, stop_event=None):
+            return [(n, u, 10.0 + i) for i, (n, u) in enumerate(sources)]
+
+        def sample(urls, stop_event=None):
+            samples["n"] += 1
+            return 360.0
+
+        session = ProbeSession(ping_fn=ping, sample_fn=sample)
+        session.ensure_probed("south_china")
+        self.assertEqual(samples["n"], 1)
+        self.assertTrue(session.high_bandwidth)
+        # 模拟静默补探换源
+        full = session.all_results() + [("新源", "https://new.example/x", 5.0)]
+        session._merge_silent_results(full, session._generation)
+        self.assertEqual(samples["n"], 1)
+        self.assertTrue(session.high_bandwidth)
+
+    def test_resample_only_when_prior_sample_invalid(self):
+        samples = {"n": 0}
+
+        def ping(sources, stop_event=None):
+            # 只返回 2 个可达 → 摸底不合格
+            out = []
+            for i, (n, u) in enumerate(sources):
+                lat = 10.0 + i if i < 2 else 99999.0
+                out.append((n, u, lat))
+            return out
+
+        def sample(urls, stop_event=None):
+            samples["n"] += 1
+            return 100.0 if len(urls) < 3 else 360.0
+
+        session = ProbeSession(ping_fn=ping, sample_fn=sample)
+        session.ensure_probed("south_china")
+        self.assertFalse(session.sample_ok)
+        self.assertEqual(samples["n"], 1)
+        # 静默补到足够源
+        full = [
+            ("A", "https://a", 10.0),
+            ("B", "https://b", 12.0),
+            ("C", "https://c", 14.0),
+            ("D", "https://d", 16.0),
+        ]
+        session._merge_silent_results(full, session._generation)
+        self.assertEqual(samples["n"], 2)
+        self.assertTrue(session.high_bandwidth)
+
+    def test_sample_concurrency_in_light_band(self):
+        tpu, total = plan_sample_concurrency(3)
+        self.assertGreaterEqual(total, 8)
+        self.assertLessEqual(total, 12)
+
+
+class TestDownloadPlanWiring(unittest.TestCase):
+    def test_session_high_bandwidth_affects_plan(self):
+        def ping(sources, stop_event=None):
+            return [(n, u, 10.0 + i) for i, (n, u) in enumerate(sources)]
+
+        low = ProbeSession(
+            ping_fn=ping, sample_fn=lambda urls, stop_event=None: 100.0,
+        )
+        low.ensure_probed("south_china")
+        _, total_low = download_plan_for_session(low, 3)
+
+        high = ProbeSession(
+            ping_fn=ping, sample_fn=lambda urls, stop_event=None: 400.0,
+        )
+        high.ensure_probed("south_china")
+        _, total_high = download_plan_for_session(high, 3)
+
+        self.assertGreaterEqual(total_low, 30)
+        self.assertLess(total_low, 40)
+        self.assertGreaterEqual(total_high, 40)
+        self.assertGreater(total_high, total_low)
 
 
 if __name__ == "__main__":
